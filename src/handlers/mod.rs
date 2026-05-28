@@ -31,7 +31,7 @@ pub async fn health() -> impl IntoResponse {
     (StatusCode::OK, "OK")
 }
 
-/// Main dispatch handler for `/hls2dash/*path`.
+/// Dispatch handler for `/hls2dash/*path` — manifest (.m3u8) or segment passthrough.
 pub async fn handle_hls2dash(
     State(state): State<AppState>,
     Path(path): Path<String>,
@@ -39,13 +39,31 @@ pub async fn handle_hls2dash(
 ) -> Result<Response, AppError> {
     let upstream_url = build_upstream_url(&path, query.as_deref());
 
-    // Decide manifest vs segment based on path extension.
     let path_without_query = path.split('?').next().unwrap_or(&path);
     if path_without_query.ends_with(".m3u8") {
         handle_manifest(state, upstream_url).await
+    } else if path_without_query.ends_with(".ts") && state.config.transmux_ts {
+        handle_ts_segment(state, upstream_url).await
     } else {
         handle_segment(state, upstream_url).await
     }
+}
+
+/// Handler for `/dash/*path` — always returns a DASH MPD regardless of URL extension.
+/// Accepts .mpd, .m3u8, or no extension; rewrites .mpd → .m3u8 when fetching upstream.
+pub async fn handle_dash_manifest(
+    State(state): State<AppState>,
+    Path(path): Path<String>,
+    RawQuery(query): RawQuery,
+) -> Result<Response, AppError> {
+    // Rewrite .mpd extension to .m3u8 for the upstream fetch.
+    let hls_path = if path.ends_with(".mpd") {
+        format!("{}.m3u8", &path[..path.len() - 4])
+    } else {
+        path
+    };
+    let upstream_url = build_upstream_url(&hls_path, query.as_deref());
+    handle_manifest(state, upstream_url).await
 }
 
 /// Handle a manifest (.m3u8) request: fetch, parse, convert to DASH MPD.
@@ -221,11 +239,11 @@ async fn handle_manifest(state: AppState, upstream_url: String) -> Result<Respon
                 .collect();
 
             let params = MpdParams {
-                master: &master,
                 video_reps,
                 audio_reps,
                 subtitle_reps,
                 proxy_base: &state.config.proxy_base,
+                transmux_ts: state.config.transmux_ts,
             };
 
             let mpd = generate_mpd(&params);
@@ -250,23 +268,12 @@ async fn handle_manifest(state: AppState, upstream_url: String) -> Result<Respon
                 is_fmp4: fmp4,
             }];
 
-            let empty_master = m3u8_rs::MasterPlaylist {
-                version: None,
-                variants: vec![],
-                alternatives: vec![],
-                session_data: vec![],
-                session_key: vec![],
-                start: None,
-                independent_segments: false,
-                unknown_tags: vec![],
-            };
-
             let params = MpdParams {
-                master: &empty_master,
                 video_reps,
                 audio_reps: vec![],
                 subtitle_reps: vec![],
                 proxy_base: &state.config.proxy_base,
+                transmux_ts: state.config.transmux_ts,
             };
 
             let mpd = generate_mpd(&params);
@@ -332,6 +339,47 @@ fn mpd_response(mpd: String) -> Result<Response, AppError> {
             HeaderValue::from_static("application/dash+xml"),
         )],
         mpd,
+    )
+        .into_response())
+}
+
+/// Handle a `.ts` segment request with transmuxing: fetch TS, pipe through ffmpeg, return fMP4 media portion.
+async fn handle_ts_segment(state: AppState, upstream_url: String) -> Result<Response, AppError> {
+    debug!(url = %upstream_url, "handling TS segment with transmux");
+
+    let (ts_bytes, _) = fetch_text(&state.http_client, &upstream_url).await?;
+    let fmp4 = crate::transmux::transmux_ts(ts_bytes)
+        .await
+        .map_err(|e| AppError::ParseError(e.to_string()))?;
+    let media = crate::transmux::extract_media(&fmp4)
+        .ok_or_else(|| AppError::ParseError("no moof box in transmuxed output".into()))?;
+    Ok((
+        StatusCode::OK,
+        [(header::CONTENT_TYPE, HeaderValue::from_static("video/mp4"))],
+        media,
+    )
+        .into_response())
+}
+
+/// Handler for `/hls2dash-init/*path` — returns the init segment (ftyp+moov) for a TS segment URL.
+pub async fn handle_ts_init(
+    State(state): State<AppState>,
+    Path(path): Path<String>,
+    RawQuery(query): RawQuery,
+) -> Result<Response, AppError> {
+    let upstream_url = build_upstream_url(&path, query.as_deref());
+    debug!(url = %upstream_url, "handling TS init segment");
+
+    let (ts_bytes, _) = fetch_text(&state.http_client, &upstream_url).await?;
+    let fmp4 = crate::transmux::transmux_ts(ts_bytes)
+        .await
+        .map_err(|e| AppError::ParseError(e.to_string()))?;
+    let init = crate::transmux::extract_init(&fmp4)
+        .ok_or_else(|| AppError::ParseError("no moov box found in transmuxed output".into()))?;
+    Ok((
+        StatusCode::OK,
+        [(header::CONTENT_TYPE, HeaderValue::from_static("video/mp4"))],
+        init,
     )
         .into_response())
 }

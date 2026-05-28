@@ -1,6 +1,6 @@
-use crate::url_utils::{proxy_url, resolve_segment_url, xml_escape};
+use crate::url_utils::{proxy_init_url, proxy_url, resolve_segment_url, xml_escape};
 use chrono::Utc;
-use m3u8_rs::{AlternativeMedia, MediaPlaylist, MasterPlaylist, VariantStream};
+use m3u8_rs::{AlternativeMedia, MediaPlaylist, VariantStream};
 use url::Url;
 
 /// All data needed to generate one Representation.
@@ -23,11 +23,11 @@ pub struct AltRepData<'a> {
 
 /// Top-level parameters for MPD generation.
 pub struct MpdParams<'a> {
-    pub master: &'a MasterPlaylist,
     pub video_reps: Vec<RepresentationData<'a>>,
     pub audio_reps: Vec<AltRepData<'a>>,
     pub subtitle_reps: Vec<AltRepData<'a>>,
     pub proxy_base: &'a str,
+    pub transmux_ts: bool,
 }
 
 /// Generate a complete DASH MPD XML string.
@@ -92,6 +92,7 @@ pub fn generate_mpd(params: &MpdParams<'_>) -> String {
             as_id,
             &params.video_reps,
             params.proxy_base,
+            params.transmux_ts,
         ));
         as_id += 1;
     }
@@ -102,6 +103,7 @@ pub fn generate_mpd(params: &MpdParams<'_>) -> String {
             as_id,
             audio,
             params.proxy_base,
+            params.transmux_ts,
         ));
         as_id += 1;
     }
@@ -135,6 +137,7 @@ fn generate_video_adaptation_set(
     id: usize,
     reps: &[RepresentationData<'_>],
     proxy_base: &str,
+    transmux_ts: bool,
 ) -> String {
     // Check for DRM (AES-128) in any representation.
     let content_protection = reps.iter().find_map(|r| {
@@ -152,7 +155,7 @@ fn generate_video_adaptation_set(
 
     let mut representations = String::new();
     for rep in reps {
-        representations.push_str(&generate_video_representation(rep, proxy_base));
+        representations.push_str(&generate_video_representation(rep, proxy_base, transmux_ts));
     }
 
     format!(
@@ -165,8 +168,14 @@ fn generate_video_adaptation_set(
     )
 }
 
-fn generate_video_representation(rep: &RepresentationData<'_>, proxy_base: &str) -> String {
-    let mime_type = if rep.is_fmp4 { "video/mp4" } else { "video/MP2T" };
+fn generate_video_representation(rep: &RepresentationData<'_>, proxy_base: &str, transmux_ts: bool) -> String {
+    let mime_type = if rep.is_fmp4 {
+        "video/mp4"
+    } else if transmux_ts {
+        "video/mp4"
+    } else {
+        "video/MP2T"
+    };
     let bandwidth = rep.variant.bandwidth;
 
     let codecs_attr = rep
@@ -184,12 +193,24 @@ fn generate_video_representation(rep: &RepresentationData<'_>, proxy_base: &str)
         .unwrap_or_default();
 
     let target_dur_ms = (rep.media_playlist.target_duration as u64) * 1000;
+
+    let first_seg_url = if !rep.is_fmp4 && transmux_ts {
+        rep.media_playlist.segments.first().and_then(|seg| {
+            resolve_segment_url(&rep.playlist_url, &seg.uri)
+                .ok()
+                .map(|u| proxy_init_url(u.as_str(), proxy_base))
+        })
+    } else {
+        None
+    };
+
     let segment_list = generate_segment_list(
         rep.media_playlist,
         &rep.playlist_url,
         rep.is_fmp4,
         target_dur_ms,
         proxy_base,
+        first_seg_url,
     );
 
     format!(
@@ -205,14 +226,31 @@ fn generate_video_representation(rep: &RepresentationData<'_>, proxy_base: &str)
     )
 }
 
-fn generate_audio_adaptation_set(id: usize, rep: &AltRepData<'_>, proxy_base: &str) -> String {
+fn generate_audio_adaptation_set(id: usize, rep: &AltRepData<'_>, proxy_base: &str, transmux_ts: bool) -> String {
     let lang = rep.alt.language.as_deref().unwrap_or("und");
     let label = &rep.alt.name;
 
     let representation = if let (Some(pl), Some(url)) = (rep.media_playlist, &rep.playlist_url) {
-        let mime_type = if rep.is_fmp4 { "audio/mp4" } else { "audio/MP2T" };
+        let mime_type = if rep.is_fmp4 {
+            "audio/mp4"
+        } else if transmux_ts {
+            "audio/mp4"
+        } else {
+            "audio/MP2T"
+        };
         let target_dur_ms = (pl.target_duration as u64) * 1000;
-        let segment_list = generate_segment_list(pl, url, rep.is_fmp4, target_dur_ms, proxy_base);
+
+        let first_seg_url = if !rep.is_fmp4 && transmux_ts {
+            pl.segments.first().and_then(|seg| {
+                resolve_segment_url(url, &seg.uri)
+                    .ok()
+                    .map(|u| proxy_init_url(u.as_str(), proxy_base))
+            })
+        } else {
+            None
+        };
+
+        let segment_list = generate_segment_list(pl, url, rep.is_fmp4, target_dur_ms, proxy_base, first_seg_url);
         format!(
             r#"      <Representation id="{}" mimeType="{}" bandwidth="128000">
 {}      </Representation>
@@ -246,7 +284,7 @@ fn generate_subtitle_adaptation_set(
 
     let representation = if let (Some(pl), Some(url)) = (rep.media_playlist, &rep.playlist_url) {
         let target_dur_ms = (pl.target_duration as u64) * 1000;
-        let segment_list = generate_segment_list(pl, url, false, target_dur_ms, proxy_base);
+        let segment_list = generate_segment_list(pl, url, false, target_dur_ms, proxy_base, None);
         format!(
             r#"      <Representation id="{}" mimeType="text/vtt" bandwidth="10000">
 {}      </Representation>
@@ -275,6 +313,7 @@ fn generate_segment_list(
     is_fmp4: bool,
     target_dur_ms: u64,
     proxy_base: &str,
+    first_seg_url: Option<String>,
 ) -> String {
     let mut lines = format!(
         r#"        <SegmentList timescale="1000" duration="{}">
@@ -282,7 +321,7 @@ fn generate_segment_list(
         target_dur_ms
     );
 
-    // Initialization segment (fMP4 only — from the first map entry).
+    // Initialization segment: fMP4 uses the map entry; transmuxed TS uses the pre-computed init URL.
     if is_fmp4 {
         if let Some(map_uri) = pl
             .segments
@@ -298,6 +337,12 @@ fn generate_segment_list(
                 ));
             }
         }
+    } else if let Some(init_url) = first_seg_url {
+        lines.push_str(&format!(
+            r#"          <Initialization sourceURL="{}"/>
+"#,
+            xml_escape(&init_url)
+        ));
     }
 
     // Segment URLs.

@@ -19,15 +19,6 @@ impl Cache {
         Cache(cache)
     }
 
-    // moka::future::Cache::get() is NOT async — it returns Option<V> directly.
-    pub fn get(&self, key: &str) -> Option<CachedResponse> {
-        self.0.get(key)
-    }
-
-    pub async fn insert(&self, key: String, value: CachedResponse) {
-        self.0.insert(key, value).await;
-    }
-
     pub async fn get_or_fetch<F, Fut>(
         &self,
         key: String,
@@ -37,7 +28,7 @@ impl Cache {
         F: FnOnce() -> Fut,
         Fut: std::future::Future<Output = anyhow::Result<CachedResponse>>,
     {
-        if let Some(cached) = self.0.get(&key) {
+        if let Some(cached) = self.0.get(&key).await {
             return Ok(cached);
         }
         let result = fetch().await?;

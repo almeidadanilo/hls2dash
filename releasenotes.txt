@@ -1,0 +1,6 @@
+v1.0.0  - Initial version
+        [2026-05-25]
+        Danilo Almeida
+v1.1.0  - Added transmux to handle HLS-TS cases
+        [2026-05-27]
+        Danilo Almeida

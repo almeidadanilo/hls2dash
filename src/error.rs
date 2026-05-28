@@ -14,9 +14,6 @@ pub enum AppError {
     #[error("invalid URL: {0}")]
     InvalidUrl(String),
 
-    #[error("unsupported format: {0}")]
-    UnsupportedFormat(String),
-
     #[error("upstream returned non-2xx status {status}: {body}")]
     UpstreamStatus { status: u16, body: String },
 }
@@ -28,9 +25,7 @@ impl IntoResponse for AppError {
             AppError::UpstreamFetch(_) | AppError::UpstreamStatus { .. } => {
                 StatusCode::BAD_GATEWAY
             }
-            AppError::ParseError(_)
-            | AppError::InvalidUrl(_)
-            | AppError::UnsupportedFormat(_) => StatusCode::BAD_REQUEST,
+            AppError::ParseError(_) | AppError::InvalidUrl(_) => StatusCode::BAD_REQUEST,
         };
         (status_code, message).into_response()
     }

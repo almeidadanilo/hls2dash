@@ -25,11 +25,6 @@ pub fn is_fmp4(pl: &MediaPlaylist) -> bool {
     pl.segments.iter().any(|seg| seg.map.is_some())
 }
 
-/// Compute total duration of all segments in seconds (VOD).
-pub fn total_duration(pl: &MediaPlaylist) -> f64 {
-    pl.segments.iter().map(|s| s.duration as f64).sum()
-}
-
 /// Return the first AES-128 key URI found in a media playlist, if any.
 pub fn first_key_uri(pl: &MediaPlaylist) -> Option<String> {
     for seg in &pl.segments {

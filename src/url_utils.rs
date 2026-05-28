@@ -22,9 +22,17 @@ pub fn proxy_url(upstream_url: &str, proxy_base: &str) -> String {
     }
 }
 
-/// Strip the query string from a URL string, returning just the path portion.
-pub fn strip_query(url: &str) -> &str {
-    url.split_once('?').map(|(p, _)| p).unwrap_or(url)
+/// Convert an upstream TS segment URL into a proxy init-segment URL.
+pub fn proxy_init_url(upstream_url: &str, proxy_base: &str) -> String {
+    let without_scheme = upstream_url
+        .strip_prefix("https://")
+        .or_else(|| upstream_url.strip_prefix("http://"))
+        .unwrap_or(upstream_url);
+    if proxy_base.is_empty() {
+        format!("/hls2dash-init/{}", without_scheme)
+    } else {
+        format!("{}/hls2dash-init/{}", proxy_base.trim_end_matches('/'), without_scheme)
+    }
 }
 
 /// Build the upstream HTTPS URL from the captured path segment and optional query string.

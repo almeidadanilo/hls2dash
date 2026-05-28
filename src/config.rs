@@ -7,6 +7,7 @@ pub struct Config {
     pub cache_max_capacity: u64,
     pub upstream_timeout_secs: u64,
     pub log_level: String,
+    pub transmux_ts: bool,
 }
 
 impl Config {
@@ -30,12 +31,17 @@ impl Config {
 
         let log_level = env::var("LOG_LEVEL").unwrap_or_else(|_| "info".to_string());
 
+        let transmux_ts = env::var("TRANSMUX_TS")
+            .map(|v| v == "true" || v == "1")
+            .unwrap_or(false);
+
         Config {
             port,
             proxy_base,
             cache_max_capacity,
             upstream_timeout_secs,
             log_level,
+            transmux_ts,
         }
     }
 }
