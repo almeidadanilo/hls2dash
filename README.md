@@ -263,4 +263,4 @@ Your API will be available at `https://hls2dash.yourdomain.com`.
 
 ## License
 
-Internal use — Synamedia.
+Internal use.
