@@ -1,4 +1,4 @@
-use crate::url_utils::{proxy_init_url, proxy_url, resolve_segment_url, xml_escape};
+use crate::url_utils::{proxy_init_from_playlist_url, proxy_init_url, proxy_url, resolve_segment_url, xml_escape};
 use chrono::Utc;
 use m3u8_rs::{AlternativeMedia, MediaPlaylist, VariantStream};
 use url::Url;
@@ -195,11 +195,18 @@ fn generate_video_representation(rep: &RepresentationData<'_>, proxy_base: &str,
     let target_dur_ms = (rep.media_playlist.target_duration as u64) * 1000;
 
     let first_seg_url = if !rep.is_fmp4 && transmux_ts {
-        rep.media_playlist.segments.first().and_then(|seg| {
-            resolve_segment_url(&rep.playlist_url, &seg.uri)
-                .ok()
-                .map(|u| proxy_init_url(u.as_str(), proxy_base))
-        })
+        if rep.media_playlist.end_list {
+            // VOD: first segment is stable, reference it directly.
+            rep.media_playlist.segments.first().and_then(|seg| {
+                resolve_segment_url(&rep.playlist_url, &seg.uri)
+                    .ok()
+                    .map(|u| proxy_init_url(u.as_str(), proxy_base))
+            })
+        } else {
+            // Live: segments expire quickly; point at the playlist so the init
+            // handler always fetches the latest available segment.
+            Some(proxy_init_from_playlist_url(rep.playlist_url.as_str(), proxy_base))
+        }
     } else {
         None
     };
@@ -241,11 +248,15 @@ fn generate_audio_adaptation_set(id: usize, rep: &AltRepData<'_>, proxy_base: &s
         let target_dur_ms = (pl.target_duration as u64) * 1000;
 
         let first_seg_url = if !rep.is_fmp4 && transmux_ts {
-            pl.segments.first().and_then(|seg| {
-                resolve_segment_url(url, &seg.uri)
-                    .ok()
-                    .map(|u| proxy_init_url(u.as_str(), proxy_base))
-            })
+            if pl.end_list {
+                pl.segments.first().and_then(|seg| {
+                    resolve_segment_url(url, &seg.uri)
+                        .ok()
+                        .map(|u| proxy_init_url(u.as_str(), proxy_base))
+                })
+            } else {
+                Some(proxy_init_from_playlist_url(url.as_str(), proxy_base))
+            }
         } else {
             None
         };

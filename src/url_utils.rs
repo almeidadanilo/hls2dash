@@ -35,6 +35,20 @@ pub fn proxy_init_url(upstream_url: &str, proxy_base: &str) -> String {
     }
 }
 
+/// Convert a media playlist URL into a playlist-based init-segment proxy URL.
+/// Used for live streams so the init segment is always derived from the current playlist.
+pub fn proxy_init_from_playlist_url(playlist_url: &str, proxy_base: &str) -> String {
+    let without_scheme = playlist_url
+        .strip_prefix("https://")
+        .or_else(|| playlist_url.strip_prefix("http://"))
+        .unwrap_or(playlist_url);
+    if proxy_base.is_empty() {
+        format!("/hls2dash-init-pl/{}", without_scheme)
+    } else {
+        format!("{}/hls2dash-init-pl/{}", proxy_base.trim_end_matches('/'), without_scheme)
+    }
+}
+
 /// Build the upstream HTTPS URL from the captured path segment and optional query string.
 pub fn build_upstream_url(path: &str, query: Option<&str>) -> String {
     let base = format!("https://{}", path.trim_start_matches('/'));
