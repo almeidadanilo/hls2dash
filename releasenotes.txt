@@ -4,3 +4,7 @@ v1.0.0  - Initial version
 v1.1.0  - Added transmux to handle HLS-TS cases
         [2026-05-27]
         Danilo Almeida
+v1.1.1  - adjusts for ec2 deployment
+        [2026-05-29]
+        Danilo Almeida
+        

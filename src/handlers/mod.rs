@@ -26,9 +26,22 @@ pub struct AppState {
     pub config: Config,
 }
 
-/// Health-check endpoint.
-pub async fn health() -> impl IntoResponse {
-    (StatusCode::OK, "OK")
+/// Health-check endpoint — returns the service version.
+pub async fn health(State(state): State<AppState>) -> impl IntoResponse {
+    (StatusCode::OK, state.config.version.clone())
+}
+
+/// Release notes endpoint — returns the contents of releasenotes.txt.
+pub async fn handle_rn() -> impl IntoResponse {
+    match tokio::fs::read_to_string("releasenotes.txt").await {
+        Ok(content) => (
+            StatusCode::OK,
+            [(header::CONTENT_TYPE, HeaderValue::from_static("text/plain; charset=utf-8"))],
+            content,
+        )
+            .into_response(),
+        Err(_) => (StatusCode::NOT_FOUND, "releasenotes.txt not found").into_response(),
+    }
 }
 
 /// Dispatch handler for `/hls2dash/*path` — manifest (.m3u8) or segment passthrough.

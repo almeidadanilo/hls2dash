@@ -8,6 +8,7 @@ pub struct Config {
     pub upstream_timeout_secs: u64,
     pub log_level: String,
     pub transmux_ts: bool,
+    pub version: String,
 }
 
 impl Config {
@@ -35,6 +36,8 @@ impl Config {
             .map(|v| v == "true" || v == "1")
             .unwrap_or(false);
 
+        let version = env::var("VERSION").unwrap_or_else(|_| "unknown".to_string());
+
         Config {
             port,
             proxy_base,
@@ -42,6 +45,7 @@ impl Config {
             upstream_timeout_secs,
             log_level,
             transmux_ts,
+            version,
         }
     }
 }

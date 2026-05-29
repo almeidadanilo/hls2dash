@@ -10,7 +10,7 @@ mod url_utils;
 
 use crate::cache::Cache;
 use crate::config::Config;
-use crate::handlers::{handle_dash_manifest, handle_hls2dash, handle_ts_init, health, AppState};
+use crate::handlers::{handle_dash_manifest, handle_hls2dash, handle_rn, handle_ts_init, health, AppState};
 use axum::{routing::get, Router};
 use reqwest::ClientBuilder;
 use std::net::SocketAddr;
@@ -69,6 +69,7 @@ async fn main() -> anyhow::Result<()> {
 
     let app = Router::new()
         .route("/health", get(health))
+        .route("/rn", get(handle_rn))
         .route("/hls2dash-init/*path", get(handle_ts_init))
         .route("/hls2dash/*path", get(handle_hls2dash))
         .route("/dash/*path", get(handle_dash_manifest))
