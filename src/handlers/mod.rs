@@ -422,6 +422,53 @@ pub async fn handle_ts_init_from_playlist(
         .into_response())
 }
 
+/// Handler for `/hls2dash-ts-pl/*path` — serves a single transmuxed TS segment from
+/// an HLS playlist. Supports AES-128 encrypted streams because FFmpeg's HLS demuxer
+/// fetches and decrypts automatically. `_idx` and `_dur` params are stripped before
+/// the remaining query is used to reconstruct the upstream playlist URL.
+pub async fn handle_ts_segment_from_playlist(
+    State(_state): State<AppState>,
+    Path(path): Path<String>,
+    RawQuery(raw_query): RawQuery,
+) -> Result<Response, AppError> {
+    // Split _idx and _dur out of the query string; the rest belongs to the playlist URL.
+    let mut seg_idx: usize = 0;
+    let mut target_dur_ms: u64 = 6000;
+    let mut other: Vec<&str> = Vec::new();
+
+    if let Some(q) = raw_query.as_deref() {
+        for part in q.split('&') {
+            if let Some(v) = part.strip_prefix("_idx=") {
+                seg_idx = v.parse().unwrap_or(0);
+            } else if let Some(v) = part.strip_prefix("_dur=") {
+                target_dur_ms = v.parse().unwrap_or(6000);
+            } else {
+                other.push(part);
+            }
+        }
+    }
+
+    let playlist_query = if other.is_empty() { None } else { Some(other.join("&")) };
+    let playlist_url = build_upstream_url(&path, playlist_query.as_deref());
+    let seek_secs = (seg_idx as f64) * (target_dur_ms as f64 / 1000.0);
+    let duration_secs = target_dur_ms as f64 / 1000.0;
+
+    debug!(url = %playlist_url, idx = seg_idx, seek = seek_secs, "TS segment from playlist");
+
+    let fmp4 = crate::transmux::transmux_ts_from_playlist_at(&playlist_url, seek_secs, duration_secs)
+        .await
+        .map_err(|e| AppError::ParseError(e.to_string()))?;
+    let media = crate::transmux::extract_media(&fmp4)
+        .ok_or_else(|| AppError::ParseError("no moof box in transmuxed segment output".into()))?;
+
+    Ok((
+        StatusCode::OK,
+        [(header::CONTENT_TYPE, HeaderValue::from_static("video/mp4"))],
+        media,
+    )
+        .into_response())
+}
+
 /// Build a minimal `VariantStream` for use when there is no master playlist.
 fn make_dummy_variant(uri: String, bandwidth: u64) -> m3u8_rs::VariantStream {
     m3u8_rs::VariantStream {

@@ -1,4 +1,4 @@
-use crate::url_utils::{proxy_init_from_playlist_url, proxy_init_url, proxy_url, resolve_segment_url, xml_escape};
+use crate::url_utils::{proxy_init_from_playlist_url, proxy_init_url, proxy_ts_pl_url, proxy_url, resolve_segment_url, xml_escape};
 use chrono::Utc;
 use m3u8_rs::{AlternativeMedia, MediaPlaylist, VariantStream};
 use url::Url;
@@ -224,6 +224,7 @@ fn generate_video_representation(rep: &RepresentationData<'_>, proxy_base: &str,
         target_dur_ms,
         proxy_base,
         first_seg_url,
+        transmux_ts,
     );
 
     format!(
@@ -267,7 +268,7 @@ fn generate_audio_adaptation_set(id: usize, rep: &AltRepData<'_>, proxy_base: &s
             None
         };
 
-        let segment_list = generate_segment_list(pl, url, rep.is_fmp4, target_dur_ms, proxy_base, first_seg_url);
+        let segment_list = generate_segment_list(pl, url, rep.is_fmp4, target_dur_ms, proxy_base, first_seg_url, transmux_ts);
         format!(
             r#"      <Representation id="{}" mimeType="{}" bandwidth="128000">
 {}      </Representation>
@@ -301,7 +302,7 @@ fn generate_subtitle_adaptation_set(
 
     let representation = if let (Some(pl), Some(url)) = (rep.media_playlist, &rep.playlist_url) {
         let target_dur_ms = (pl.target_duration as u64) * 1000;
-        let segment_list = generate_segment_list(pl, url, false, target_dur_ms, proxy_base, None);
+        let segment_list = generate_segment_list(pl, url, false, target_dur_ms, proxy_base, None, false);
         format!(
             r#"      <Representation id="{}" mimeType="text/vtt" bandwidth="10000">
 {}      </Representation>
@@ -331,6 +332,7 @@ fn generate_segment_list(
     target_dur_ms: u64,
     proxy_base: &str,
     first_seg_url: Option<String>,
+    transmux_ts: bool,
 ) -> String {
     let mut lines = format!(
         r#"        <SegmentList timescale="1000" duration="{}">
@@ -363,17 +365,23 @@ fn generate_segment_list(
     }
 
     // Segment URLs.
-    for seg in &pl.segments {
-        if let Ok(abs_url) = resolve_segment_url(base_url, &seg.uri) {
-            let proxied = proxy_url(abs_url.as_str(), proxy_base);
-            let dur_ms = (seg.duration * 1000.0) as u64;
-            lines.push_str(&format!(
-                r#"          <SegmentURL media="{}" duration="{}"/>
+    for (idx, seg) in pl.segments.iter().enumerate() {
+        let proxied = if !is_fmp4 && transmux_ts {
+            // For TS+transmux, route through the playlist-aware endpoint so FFmpeg
+            // can handle AES-128 decryption via the HLS demuxer.
+            proxy_ts_pl_url(base_url.as_str(), idx, target_dur_ms, proxy_base)
+        } else if let Ok(abs_url) = resolve_segment_url(base_url, &seg.uri) {
+            proxy_url(abs_url.as_str(), proxy_base)
+        } else {
+            continue;
+        };
+        let dur_ms = (seg.duration * 1000.0) as u64;
+        lines.push_str(&format!(
+            r#"          <SegmentURL media="{}" duration="{}"/>
 "#,
-                xml_escape(&proxied),
-                dur_ms
-            ));
-        }
+            xml_escape(&proxied),
+            dur_ms
+        ));
     }
 
     lines.push_str("        </SegmentList>\n");

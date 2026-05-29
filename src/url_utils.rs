@@ -49,6 +49,28 @@ pub fn proxy_init_from_playlist_url(playlist_url: &str, proxy_base: &str) -> Str
     }
 }
 
+/// Build a playlist-based TS segment proxy URL used for transmuxed live streams.
+/// The player requests `/hls2dash-ts-pl/<playlist_host>/<playlist_path>?<pl_query>&_idx=N&_dur=D`.
+/// The handler fetches the current playlist and asks FFmpeg to seek to segment N.
+pub fn proxy_ts_pl_url(
+    playlist_url: &str,
+    seg_idx: usize,
+    target_dur_ms: u64,
+    proxy_base: &str,
+) -> String {
+    let without_scheme = playlist_url
+        .strip_prefix("https://")
+        .or_else(|| playlist_url.strip_prefix("http://"))
+        .unwrap_or(playlist_url);
+    let sep = if without_scheme.contains('?') { "&" } else { "?" };
+    let suffix = format!("{}_idx={}&_dur={}", sep, seg_idx, target_dur_ms);
+    if proxy_base.is_empty() {
+        format!("/hls2dash-ts-pl/{}{}", without_scheme, suffix)
+    } else {
+        format!("{}/hls2dash-ts-pl/{}{}", proxy_base.trim_end_matches('/'), without_scheme, suffix)
+    }
+}
+
 /// Build the upstream HTTPS URL from the captured path segment and optional query string.
 pub fn build_upstream_url(path: &str, query: Option<&str>) -> String {
     let base = format!("https://{}", path.trim_start_matches('/'));

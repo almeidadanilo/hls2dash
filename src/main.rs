@@ -10,7 +10,7 @@ mod url_utils;
 
 use crate::cache::Cache;
 use crate::config::Config;
-use crate::handlers::{handle_dash_manifest, handle_hls2dash, handle_rn, handle_ts_init, handle_ts_init_from_playlist, health, AppState};
+use crate::handlers::{handle_dash_manifest, handle_hls2dash, handle_rn, handle_ts_init, handle_ts_init_from_playlist, handle_ts_segment_from_playlist, health, AppState};
 use axum::{routing::get, Router};
 use reqwest::ClientBuilder;
 use std::net::SocketAddr;
@@ -70,6 +70,7 @@ async fn main() -> anyhow::Result<()> {
     let app = Router::new()
         .route("/health", get(health))
         .route("/rn", get(handle_rn))
+        .route("/hls2dash-ts-pl/*path", get(handle_ts_segment_from_playlist))
         .route("/hls2dash-init-pl/*path", get(handle_ts_init_from_playlist))
         .route("/hls2dash-init/*path", get(handle_ts_init))
         .route("/hls2dash/*path", get(handle_hls2dash))

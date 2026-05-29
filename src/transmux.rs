@@ -64,6 +64,41 @@ pub async fn transmux_ts_from_url(url: &str) -> anyhow::Result<Bytes> {
     Ok(Bytes::from(output.stdout))
 }
 
+/// Seek to a specific segment within an HLS playlist and transmux it to fMP4.
+/// FFmpeg handles AES-128 decryption automatically via its HLS demuxer.
+/// `seek_secs` = segment_index * target_duration; `duration_secs` = target_duration.
+pub async fn transmux_ts_from_playlist_at(
+    playlist_url: &str,
+    seek_secs: f64,
+    duration_secs: f64,
+) -> anyhow::Result<Bytes> {
+    let child = Command::new("ffmpeg")
+        .args([
+            "-loglevel", "error",
+            "-allowed_extensions", "ALL",
+            "-protocol_whitelist", "file,http,https,tcp,tls,crypto",
+            "-i", playlist_url,
+            "-ss", &format!("{:.3}", seek_secs),
+            "-t", &format!("{:.3}", duration_secs + 2.0),
+            "-c", "copy",
+            "-movflags", "frag_keyframe+default_base_moof",
+            "-f", "mp4",
+            "pipe:1",
+        ])
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .map_err(|e| anyhow!("failed to spawn ffmpeg: {}", e))?;
+
+    let output = child.wait_with_output().await?;
+    if output.stdout.is_empty() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        return Err(anyhow!("ffmpeg produced no output from playlist seek: {}", stderr));
+    }
+    Ok(Bytes::from(output.stdout))
+}
+
 /// Extract init segment (ftyp + moov) — everything before the first `moof` box.
 pub fn extract_init(fmp4: &[u8]) -> Option<Bytes> {
     find_box_offset(fmp4, b"moof").map(|pos| Bytes::copy_from_slice(&fmp4[..pos]))
