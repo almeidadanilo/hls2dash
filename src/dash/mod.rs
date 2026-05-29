@@ -73,13 +73,19 @@ pub fn generate_mpd(params: &MpdParams<'_>) -> String {
             total_secs
         )
     } else {
-        let shift_secs = (media_seq as f64) * target_duration;
+        // Anchor availabilityStartTime so that our SegmentList (indices 0..n_segs-1)
+        // aligns with the live window. Index 0 = oldest segment = n_segs * target_dur ago.
+        // Using media_seq here would place index 0 thousands of segments in the past for
+        // long-running streams, causing players to look for segment indices beyond our list.
+        let _ = media_seq; // retained for potential future use
+        let shift_secs = (n_segs as f64) * target_duration;
         let avail_start = Utc::now() - chrono::Duration::milliseconds((shift_secs * 1000.0) as i64);
         let avail_start_str = avail_start.format("%Y-%m-%dT%H:%M:%SZ");
         let tsb_depth = (n_segs as f64) * target_duration;
+        let suggested_delay = target_duration * 3.0;
         format!(
-            r#"type="dynamic" availabilityStartTime="{}" minimumUpdatePeriod="PT{:.1}S" timeShiftBufferDepth="PT{:.1}S""#,
-            avail_start_str, target_duration, tsb_depth
+            r#"type="dynamic" availabilityStartTime="{}" minimumUpdatePeriod="PT{:.1}S" timeShiftBufferDepth="PT{:.1}S" suggestedPresentationDelay="PT{:.1}S""#,
+            avail_start_str, target_duration, tsb_depth, suggested_delay
         )
     };
 
