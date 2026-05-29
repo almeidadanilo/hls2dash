@@ -397,39 +397,18 @@ pub async fn handle_ts_init(
         .into_response())
 }
 
-/// Handler for `/hls2dash-init-pl/*path` — fetches the current media playlist, takes
-/// the latest segment, transmuxes it, and returns the ftyp+moov init segment.
-/// Used for live streams where a hardcoded segment URL would expire.
+/// Handler for `/hls2dash-init-pl/*path` — passes the media playlist URL directly to
+/// FFmpeg so its HLS demuxer fetches segments and handles AES-128 decryption automatically.
+/// Returns the ftyp+moov init segment.
 pub async fn handle_ts_init_from_playlist(
-    State(state): State<AppState>,
+    State(_state): State<AppState>,
     Path(path): Path<String>,
     RawQuery(query): RawQuery,
 ) -> Result<Response, AppError> {
     let playlist_url = build_upstream_url(&path, query.as_deref());
-    debug!(url = %playlist_url, "handling TS init from playlist");
+    debug!(url = %playlist_url, "handling TS init from playlist via ffmpeg HLS demuxer");
 
-    let (bytes, _) = fetch_text_cached(&state, &playlist_url).await?;
-    let media_pl = match parse_playlist(&bytes)? {
-        ParsedPlaylist::Media(pl) => pl,
-        ParsedPlaylist::Master(_) => {
-            return Err(AppError::ParseError("expected media playlist for init".into()))
-        }
-    };
-
-    let base_url = Url::parse(&playlist_url)
-        .map_err(|e| AppError::InvalidUrl(e.to_string()))?;
-
-    let seg_uri = media_pl
-        .segments
-        .last()
-        .map(|s| s.uri.as_str())
-        .ok_or_else(|| AppError::ParseError("empty playlist".into()))?;
-
-    let seg_url = crate::url_utils::resolve_segment_url(&base_url, seg_uri)
-        .map_err(|e| AppError::InvalidUrl(e.to_string()))?;
-
-    let (ts_bytes, _) = fetch_text(&state.http_client, seg_url.as_str()).await?;
-    let fmp4 = crate::transmux::transmux_ts(ts_bytes)
+    let fmp4 = crate::transmux::transmux_ts_from_url(&playlist_url)
         .await
         .map_err(|e| AppError::ParseError(e.to_string()))?;
     let init = crate::transmux::extract_init(&fmp4)

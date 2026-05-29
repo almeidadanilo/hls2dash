@@ -34,6 +34,36 @@ pub async fn transmux_ts(ts_bytes: Bytes) -> anyhow::Result<Bytes> {
     Ok(Bytes::from(output.stdout))
 }
 
+/// Transmux an HLS media playlist URL to fragmented MP4 via ffmpeg's HLS demuxer.
+/// FFmpeg fetches the segments itself and handles AES-128 decryption automatically.
+/// `-t 15` ensures we stop after one or two segments rather than streaming indefinitely.
+pub async fn transmux_ts_from_url(url: &str) -> anyhow::Result<Bytes> {
+    let child = Command::new("ffmpeg")
+        .args([
+            "-loglevel", "error",
+            "-allowed_extensions", "ALL",
+            "-protocol_whitelist", "file,http,https,tcp,tls,crypto",
+            "-i", url,
+            "-t", "15",
+            "-c", "copy",
+            "-movflags", "frag_keyframe+default_base_moof",
+            "-f", "mp4",
+            "pipe:1",
+        ])
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .map_err(|e| anyhow!("failed to spawn ffmpeg: {}. Is ffmpeg installed and in PATH?", e))?;
+
+    let output = child.wait_with_output().await?;
+    if output.stdout.is_empty() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        return Err(anyhow!("ffmpeg produced no output from URL: {}", stderr));
+    }
+    Ok(Bytes::from(output.stdout))
+}
+
 /// Extract init segment (ftyp + moov) — everything before the first `moof` box.
 pub fn extract_init(fmp4: &[u8]) -> Option<Bytes> {
     find_box_offset(fmp4, b"moof").map(|pos| Bytes::copy_from_slice(&fmp4[..pos]))
