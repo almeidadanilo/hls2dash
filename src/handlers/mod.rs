@@ -386,8 +386,7 @@ pub async fn handle_ts_init(
     let upstream_url = build_upstream_url(&path, query.as_deref());
     debug!(url = %upstream_url, "handling TS init segment");
 
-    let (ts_bytes, _) = fetch_text(&state.http_client, &upstream_url).await?;
-    let fmp4 = crate::transmux::transmux_ts(ts_bytes)
+    let fmp4 = crate::transmux::transmux_ts_from_segment_url(&upstream_url)
         .await
         .map_err(|e| AppError::ParseError(e.to_string()))?;
     let init = crate::transmux::extract_init(&fmp4)
