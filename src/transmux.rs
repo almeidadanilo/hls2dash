@@ -12,6 +12,7 @@ pub async fn transmux_ts(ts_bytes: Bytes) -> anyhow::Result<Bytes> {
             "-loglevel", "error",
             "-i", "pipe:0",
             "-c", "copy",
+            "-bsf:a", "aac_adtstoasc",
             "-movflags", "frag_keyframe+default_base_moof",
             "-f", "mp4",
             "pipe:1",
@@ -35,6 +36,7 @@ pub async fn transmux_ts(ts_bytes: Bytes) -> anyhow::Result<Bytes> {
 }
 
 /// Transmux an HLS media playlist URL to fragmented MP4 via ffmpeg's HLS demuxer.
+#[allow(dead_code)]
 /// FFmpeg fetches the segments itself and handles AES-128 decryption automatically.
 /// `-t 15` ensures we stop after one or two segments rather than streaming indefinitely.
 pub async fn transmux_ts_from_url(url: &str) -> anyhow::Result<Bytes> {
@@ -64,24 +66,23 @@ pub async fn transmux_ts_from_url(url: &str) -> anyhow::Result<Bytes> {
     Ok(Bytes::from(output.stdout))
 }
 
-/// Seek to a specific segment within an HLS playlist and transmux it to fMP4.
-/// FFmpeg handles AES-128 decryption automatically via its HLS demuxer.
-/// `seek_secs` = segment_index * target_duration; `duration_secs` = target_duration.
-pub async fn transmux_ts_from_playlist_at(
-    playlist_url: &str,
-    seek_secs: f64,
-    duration_secs: f64,
-) -> anyhow::Result<Bytes> {
+/// Transmux a single TS segment URL directly to fMP4.
+/// FFmpeg fetches the segment itself via HTTPS — no stdin pipe, no temp file.
+/// Works for unencrypted streams. For AES-128, use transmux_ts_from_file with a mini M3U8.
+pub async fn transmux_ts_from_segment_url(url: &str) -> anyhow::Result<Bytes> {
     let child = Command::new("ffmpeg")
         .args([
             "-loglevel", "error",
-            "-allowed_extensions", "ALL",
+            // No -allowed_extensions here: that flag is HLS-demuxer-only and
+            // causes "Option not found" when the input is a raw .ts HTTPS URL.
             "-protocol_whitelist", "file,http,https,tcp,tls,crypto",
-            "-i", playlist_url,
-            "-ss", &format!("{:.3}", seek_secs),
-            "-t", &format!("{:.3}", duration_secs + 2.0),
+            "-i", url,
             "-c", "copy",
-            "-movflags", "frag_keyframe+default_base_moof",
+            // ADTS→ASC: MPEG-TS carries AAC in ADTS format; MP4 requires ASC.
+            "-bsf:a", "aac_adtstoasc",
+            // empty_moov forces fMP4 container mode immediately, preventing fallback
+            // to non-fragmented MP4 when the MPEG-TS demuxer misses keyframe flags.
+            "-movflags", "empty_moov+frag_keyframe+default_base_moof",
             "-f", "mp4",
             "pipe:1",
         ])
@@ -92,9 +93,56 @@ pub async fn transmux_ts_from_playlist_at(
         .map_err(|e| anyhow!("failed to spawn ffmpeg: {}", e))?;
 
     let output = child.wait_with_output().await?;
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    if !stderr.is_empty() {
+        tracing::warn!(ffmpeg_stderr = %stderr, "ffmpeg segment stderr");
+    }
+    let bytes = Bytes::from(output.stdout);
+    let has_moof_toplevel = extract_media(&bytes).is_some();
+    let has_moof_anywhere = bytes.windows(4).any(|w| w == b"moof");
+    // Log first 64 bytes as hex to inspect the box structure
+    let prefix: Vec<String> = bytes.iter().take(64).map(|b| format!("{:02x}", b)).collect();
+    tracing::debug!(
+        output_bytes = bytes.len(),
+        has_moof_toplevel,
+        has_moof_anywhere,
+        first_64_bytes = %prefix.join(" "),
+        "ffmpeg segment URL output"
+    );
+    if bytes.is_empty() {
+        return Err(anyhow!("ffmpeg produced no output for segment URL: {}", stderr));
+    }
+    Ok(bytes)
+}
+
+/// Transmux a single-segment mini-playlist file to fMP4.
+/// Used for AES-128 encrypted segments where the key context is embedded in the M3U8.
+pub async fn transmux_ts_from_file(path: &str) -> anyhow::Result<Bytes> {
+    let child = Command::new("ffmpeg")
+        .args([
+            "-loglevel", "error",
+            "-allowed_extensions", "ALL",
+            "-protocol_whitelist", "file,http,https,tcp,tls,crypto",
+            "-i", path,
+            "-c", "copy",
+            "-bsf:a", "aac_adtstoasc",
+            "-movflags", "empty_moov+frag_keyframe+default_base_moof",
+            "-f", "mp4",
+            "pipe:1",
+        ])
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .map_err(|e| anyhow!("failed to spawn ffmpeg: {}", e))?;
+
+    let output = child.wait_with_output().await?;
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    if !stderr.is_empty() {
+        tracing::warn!(ffmpeg_stderr = %stderr, "ffmpeg mini-playlist stderr");
+    }
     if output.stdout.is_empty() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        return Err(anyhow!("ffmpeg produced no output from playlist seek: {}", stderr));
+        return Err(anyhow!("ffmpeg produced no output from mini-playlist: {}", stderr));
     }
     Ok(Bytes::from(output.stdout))
 }

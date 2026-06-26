@@ -1,5 +1,5 @@
 use axum::{
-    http::StatusCode,
+    http::{header, HeaderValue, StatusCode},
     response::{IntoResponse, Response},
 };
 
@@ -27,7 +27,12 @@ impl IntoResponse for AppError {
             }
             AppError::ParseError(_) | AppError::InvalidUrl(_) => StatusCode::BAD_REQUEST,
         };
-        (status_code, message).into_response()
+        let mut res = (status_code, message).into_response();
+        res.headers_mut().insert(
+            header::ACCESS_CONTROL_ALLOW_ORIGIN,
+            HeaderValue::from_static("*"),
+        );
+        res
     }
 }
 

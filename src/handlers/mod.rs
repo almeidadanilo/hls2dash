@@ -16,8 +16,11 @@ use bytes::Bytes;
 use futures::future::join_all;
 use reqwest::Client;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use tracing::debug;
 use url::Url;
+
+static SEG_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 #[derive(Clone)]
 pub struct AppState {
@@ -397,9 +400,9 @@ pub async fn handle_ts_init(
         .into_response())
 }
 
-/// Handler for `/hls2dash-init-pl/*path` — passes the media playlist URL directly to
-/// FFmpeg so its HLS demuxer fetches segments and handles AES-128 decryption automatically.
-/// Returns the ftyp+moov init segment.
+/// Handler for `/hls2dash-init-pl/*path` — passes the media playlist URL to FFmpeg's HLS
+/// demuxer which produces a moov with complete codec configuration (SPS/PPS in avcC).
+/// The HLS demuxer path is required because Chrome MSE rejects init segments without SPS/PPS.
 pub async fn handle_ts_init_from_playlist(
     State(_state): State<AppState>,
     Path(path): Path<String>,
@@ -422,16 +425,14 @@ pub async fn handle_ts_init_from_playlist(
         .into_response())
 }
 
-/// Handler for `/hls2dash-ts-pl/*path` — serves a single transmuxed TS segment from
-/// an HLS playlist. Supports AES-128 encrypted streams because FFmpeg's HLS demuxer
-/// fetches and decrypts automatically. `_idx` and `_dur` params are stripped before
-/// the remaining query is used to reconstruct the upstream playlist URL.
+/// Handler for `/hls2dash-ts-pl/*path` — builds a single-segment mini M3U8 (with AES-128
+/// key info if present) and feeds it to FFmpeg. Avoids time-based seeking entirely, which
+/// breaks on streams that use EXT-X-PROGRAM-DATE-TIME with absolute timestamps.
 pub async fn handle_ts_segment_from_playlist(
-    State(_state): State<AppState>,
+    State(state): State<AppState>,
     Path(path): Path<String>,
     RawQuery(raw_query): RawQuery,
 ) -> Result<Response, AppError> {
-    // Split _idx and _dur out of the query string; the rest belongs to the playlist URL.
     let mut seg_idx: usize = 0;
     let mut target_dur_ms: u64 = 6000;
     let mut other: Vec<&str> = Vec::new();
@@ -450,14 +451,80 @@ pub async fn handle_ts_segment_from_playlist(
 
     let playlist_query = if other.is_empty() { None } else { Some(other.join("&")) };
     let playlist_url = build_upstream_url(&path, playlist_query.as_deref());
-    let seek_secs = (seg_idx as f64) * (target_dur_ms as f64 / 1000.0);
-    let duration_secs = target_dur_ms as f64 / 1000.0;
+    debug!(url = %playlist_url, idx = seg_idx, "TS segment via mini-m3u8");
 
-    debug!(url = %playlist_url, idx = seg_idx, seek = seek_secs, "TS segment from playlist");
+    // Fetch the current playlist.
+    let (bytes, _) = fetch_text_cached(&state, &playlist_url).await?;
+    let media_pl = match parse_playlist(&bytes)? {
+        ParsedPlaylist::Media(pl) => pl,
+        ParsedPlaylist::Master(_) => {
+            return Err(AppError::ParseError("expected media playlist for segment".into()))
+        }
+    };
 
-    let fmp4 = crate::transmux::transmux_ts_from_playlist_at(&playlist_url, seek_secs, duration_secs)
-        .await
-        .map_err(|e| AppError::ParseError(e.to_string()))?;
+    let base_url = Url::parse(&playlist_url)
+        .map_err(|e| AppError::InvalidUrl(e.to_string()))?;
+
+    // Clamp to available range — playlist may have rolled since MPD was generated.
+    let actual_idx = seg_idx.min(media_pl.segments.len().saturating_sub(1));
+    let seg = media_pl.segments.get(actual_idx)
+        .ok_or_else(|| AppError::ParseError("empty playlist".into()))?;
+
+    let seg_url = crate::url_utils::resolve_segment_url(&base_url, &seg.uri)
+        .map_err(|e| AppError::InvalidUrl(e.to_string()))?;
+
+    // Build a single-segment mini M3U8 with correct AES-128 key and IV.
+    let seq_num = media_pl.media_sequence + actual_idx as u64;
+    let target_dur_secs = target_dur_ms / 1000;
+    let mut mini = format!(
+        "#EXTM3U\n#EXT-X-VERSION:3\n#EXT-X-TARGETDURATION:{}\n#EXT-X-MEDIA-SEQUENCE:{}\n",
+        target_dur_secs, seq_num
+    );
+
+    // m3u8-rs only stores the key on the segment directly following #EXT-X-KEY,
+    // not on all subsequent segments. Scan the whole playlist for the applicable key.
+    let applicable_key = media_pl.segments.iter().find_map(|s| s.key.as_ref());
+    if let Some(key) = applicable_key {
+        if matches!(key.method, m3u8_rs::KeyMethod::AES128) {
+            if let Some(key_uri_raw) = &key.uri {
+                let abs_key_uri = crate::url_utils::resolve_segment_url(&base_url, key_uri_raw)
+                    .map(|u| u.to_string())
+                    .unwrap_or_else(|_| key_uri_raw.clone());
+                // Always derive IV from the actual segment's sequence number —
+                // the found key might be from segment 0, not from actual_idx.
+                let iv_part = format!(",IV=0x{:032x}", seq_num);
+                mini.push_str(&format!(
+                    "#EXT-X-KEY:METHOD=AES-128,URI=\"{}\"{}\n",
+                    abs_key_uri, iv_part
+                ));
+            }
+        }
+    }
+
+    mini.push_str(&format!(
+        "#EXTINF:{:.3},\n{}\n#EXT-X-ENDLIST\n",
+        seg.duration,
+        seg_url.as_str()
+    ));
+
+    // Try transmuxing the segment URL directly first (works for unencrypted streams).
+    // Fall back to the mini M3U8 temp-file approach for AES-128 encrypted streams.
+    let fmp4 = match crate::transmux::transmux_ts_from_segment_url(seg_url.as_str()).await {
+        Ok(bytes) => bytes,
+        Err(direct_err) => {
+            debug!(err = %direct_err, "direct segment transmux failed, trying mini M3U8");
+            let n = SEG_COUNTER.fetch_add(1, Ordering::Relaxed);
+            let temp_path = std::env::temp_dir().join(format!("hls2dash_{}.m3u8", n));
+            debug!(mini_m3u8 = %mini, temp_file = ?temp_path, "generated mini M3U8");
+            tokio::fs::write(&temp_path, mini.as_bytes()).await
+                .map_err(|e| AppError::ParseError(format!("failed to write temp m3u8: {}", e)))?;
+            let result = crate::transmux::transmux_ts_from_file(temp_path.to_str().unwrap_or("")).await;
+            if result.is_ok() {
+                let _ = tokio::fs::remove_file(&temp_path).await;
+            }
+            result.map_err(|e| AppError::ParseError(e.to_string()))?
+        }
+    };
     let media = crate::transmux::extract_media(&fmp4)
         .ok_or_else(|| AppError::ParseError("no moof box in transmuxed segment output".into()))?;
 

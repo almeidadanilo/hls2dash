@@ -103,7 +103,7 @@ pub fn generate_mpd(params: &MpdParams<'_>) -> String {
         as_id += 1;
     }
 
-    // Audio AdaptationSets
+    // Audio AdaptationSets from EXT-X-MEDIA alternates.
     for audio in &params.audio_reps {
         adaptation_sets.push_str(&generate_audio_adaptation_set(
             as_id,
@@ -113,6 +113,8 @@ pub fn generate_mpd(params: &MpdParams<'_>) -> String {
         ));
         as_id += 1;
     }
+
+    let _ = as_id;
 
     // Subtitle AdaptationSets
     for sub in &params.subtitle_reps {
