@@ -401,6 +401,7 @@ pub async fn handle_ts_init(
                 .map_err(anyhow::Error::from)?;
             let init = crate::transmux::extract_init(&fmp4)
                 .ok_or_else(|| anyhow::anyhow!("no moov box found in transmuxed output"))?;
+            let init = crate::transmux::patch_moov_duration(&init);
             Ok(CachedResponse {
                 body: init,
                 content_type: "video/mp4".to_string(),

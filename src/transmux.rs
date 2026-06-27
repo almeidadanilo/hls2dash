@@ -152,6 +152,55 @@ pub fn extract_init(fmp4: &[u8]) -> Option<Bytes> {
     find_box_offset(fmp4, b"moof").map(|pos| Bytes::copy_from_slice(&fmp4[..pos]))
 }
 
+/// Zero out duration fields in mvhd, tkhd, and mdhd boxes within an init segment.
+///
+/// Without this, Chrome MSE treats the moov duration (which FFmpeg sets to the first
+/// segment's length) as appendWindowEnd. Any media data timestamped beyond that value
+/// is silently discarded, causing playback to stall after the first segment.
+pub fn patch_moov_duration(init: &[u8]) -> Bytes {
+    let mut data = init.to_vec();
+    let len = data.len();
+    patch_boxes(&mut data, 0, len);
+    Bytes::from(data)
+}
+
+fn patch_boxes(data: &mut [u8], start: usize, end: usize) {
+    let mut pos = start;
+    while pos + 8 <= end {
+        let size = u32::from_be_bytes([data[pos], data[pos + 1], data[pos + 2], data[pos + 3]])
+            as usize;
+        if size < 8 || pos + size > end {
+            break;
+        }
+        let tag = [data[pos + 4], data[pos + 5], data[pos + 6], data[pos + 7]];
+        match &tag {
+            b"moov" | b"trak" | b"mdia" => {
+                patch_boxes(data, pos + 8, pos + size);
+            }
+            b"mvhd" | b"mdhd" => {
+                // version=0: duration at +24 (4 bytes); version=1: at +32 (8 bytes)
+                if pos + 9 <= end {
+                    let (off, len) = if data[pos + 8] == 0 { (pos + 24, 4) } else { (pos + 32, 8) };
+                    if off + len <= end {
+                        data[off..off + len].fill(0);
+                    }
+                }
+            }
+            b"tkhd" => {
+                // version=0: duration at +28 (4 bytes); version=1: at +36 (8 bytes)
+                if pos + 9 <= end {
+                    let (off, len) = if data[pos + 8] == 0 { (pos + 28, 4) } else { (pos + 36, 8) };
+                    if off + len <= end {
+                        data[off..off + len].fill(0);
+                    }
+                }
+            }
+            _ => {}
+        }
+        pos += size;
+    }
+}
+
 /// Extract media segment — everything from the first `moof` box onwards.
 pub fn extract_media(fmp4: &[u8]) -> Option<Bytes> {
     find_box_offset(fmp4, b"moof").map(|pos| Bytes::copy_from_slice(&fmp4[pos..]))
