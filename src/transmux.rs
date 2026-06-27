@@ -207,7 +207,27 @@ pub fn extract_media(fmp4: &[u8]) -> Option<Bytes> {
     find_box_offset(fmp4, b"moof").map(|pos| Bytes::copy_from_slice(&fmp4[pos..]))
 }
 
-/// Return the byte offset of the first MP4 box with the given 4-byte type tag.
+/// Read the baseMediaDecodeTime from the first tfdt box in the first traf in the first moof.
+/// Returns None if the structure is not found or malformed.
+pub fn read_tfdt(media: &[u8]) -> Option<u64> {
+    let moof_off = find_box_offset(media, b"moof")?;
+    let moof_size = u32::from_be_bytes(media.get(moof_off..moof_off + 4)?.try_into().ok()?) as usize;
+    let moof_end = moof_off + moof_size;
+    let traf_off = find_box_in_range(media, moof_off + 8, moof_end, b"traf")?;
+    let traf_size = u32::from_be_bytes(media.get(traf_off..traf_off + 4)?.try_into().ok()?) as usize;
+    let traf_end = traf_off + traf_size;
+    let tfdt_off = find_box_in_range(media, traf_off + 8, traf_end, b"tfdt")?;
+    let version = *media.get(tfdt_off + 8)?;
+    if version == 0 {
+        let t = media.get(tfdt_off + 12..tfdt_off + 16)?;
+        Some(u32::from_be_bytes(t.try_into().ok()?) as u64)
+    } else {
+        let t = media.get(tfdt_off + 12..tfdt_off + 20)?;
+        Some(u64::from_be_bytes(t.try_into().ok()?))
+    }
+}
+
+/// Return the byte offset of the first MP4 box with the given 4-byte type tag (top-level scan).
 fn find_box_offset(data: &[u8], box_type: &[u8; 4]) -> Option<usize> {
     let mut pos = 0;
     while pos + 8 <= data.len() {
@@ -216,6 +236,23 @@ fn find_box_offset(data: &[u8], box_type: &[u8; 4]) -> Option<usize> {
             return Some(pos);
         }
         if size < 8 || pos + size > data.len() {
+            break;
+        }
+        pos += size;
+    }
+    None
+}
+
+/// Scan for a box of the given type within [start, end) of data.
+fn find_box_in_range(data: &[u8], start: usize, end: usize, box_type: &[u8; 4]) -> Option<usize> {
+    let mut pos = start;
+    let limit = end.min(data.len());
+    while pos + 8 <= limit {
+        let size = u32::from_be_bytes(data[pos..pos + 4].try_into().ok()?) as usize;
+        if &data[pos + 4..pos + 8] == box_type {
+            return Some(pos);
+        }
+        if size < 8 || pos + size > limit {
             break;
         }
         pos += size;

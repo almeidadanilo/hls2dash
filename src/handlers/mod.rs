@@ -410,6 +410,13 @@ pub async fn handle_ts_init(
         .await
         .map_err(|e| AppError::ParseError(e.to_string()))?;
 
+    let hex: Vec<String> = result.body.iter().take(64).map(|b| format!("{:02x}", b)).collect();
+    tracing::info!(
+        url = %upstream_url,
+        size = result.body.len(),
+        first_64_bytes = %hex.join(" "),
+        "serving init segment"
+    );
     Ok((
         StatusCode::OK,
         [(header::CONTENT_TYPE, HeaderValue::from_static("video/mp4"))],
@@ -553,6 +560,16 @@ pub async fn handle_ts_segment_from_playlist(
     };
     let media = crate::transmux::extract_media(&fmp4)
         .ok_or_else(|| AppError::ParseError("no moof box in transmuxed segment output".into()))?;
+
+    let tfdt = crate::transmux::read_tfdt(&media);
+    let moof_hex: Vec<String> = media.iter().take(16).map(|b| format!("{:02x}", b)).collect();
+    tracing::info!(
+        idx = seg_idx,
+        size = media.len(),
+        moof_header = %moof_hex.join(" "),
+        tfdt_base_media_decode_time = ?tfdt,
+        "serving media segment"
+    );
 
     Ok((
         StatusCode::OK,
