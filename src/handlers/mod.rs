@@ -378,6 +378,7 @@ async fn handle_ts_segment(state: AppState, upstream_url: String) -> Result<Resp
 }
 
 /// Handler for `/hls2dash-init/*path` — returns the init segment (ftyp+moov) for a TS segment URL.
+/// The transmux result is cached so rapid ABR quality switches don't re-invoke FFmpeg.
 pub async fn handle_ts_init(
     State(state): State<AppState>,
     Path(path): Path<String>,
@@ -386,16 +387,32 @@ pub async fn handle_ts_init(
     let upstream_url = build_upstream_url(&path, query.as_deref());
     debug!(url = %upstream_url, "handling TS init segment");
 
-    let (ts_bytes, _) = fetch_text(&state.http_client, &upstream_url).await?;
-    let fmp4 = crate::transmux::transmux_ts(ts_bytes)
+    let client = state.http_client.clone();
+    let url_owned = upstream_url.clone();
+
+    let result = state
+        .playlist_cache
+        .get_or_fetch(format!("init:{}", upstream_url), move || async move {
+            let (ts_bytes, _) = fetch_text(&client, &url_owned)
+                .await
+                .map_err(anyhow::Error::from)?;
+            let fmp4 = crate::transmux::transmux_ts(ts_bytes)
+                .await
+                .map_err(anyhow::Error::from)?;
+            let init = crate::transmux::extract_init(&fmp4)
+                .ok_or_else(|| anyhow::anyhow!("no moov box found in transmuxed output"))?;
+            Ok(CachedResponse {
+                body: init,
+                content_type: "video/mp4".to_string(),
+            })
+        })
         .await
         .map_err(|e| AppError::ParseError(e.to_string()))?;
-    let init = crate::transmux::extract_init(&fmp4)
-        .ok_or_else(|| AppError::ParseError("no moov box found in transmuxed output".into()))?;
+
     Ok((
         StatusCode::OK,
         [(header::CONTENT_TYPE, HeaderValue::from_static("video/mp4"))],
-        init,
+        result.body,
     )
         .into_response())
 }

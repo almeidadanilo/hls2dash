@@ -167,7 +167,7 @@ fn generate_video_adaptation_set(
     }
 
     format!(
-        r#"    <AdaptationSet id="{}" contentType="video" segmentAlignment="true" bitstreamSwitching="true">
+        r#"    <AdaptationSet id="{}" contentType="video" segmentAlignment="true">
 {}{}    </AdaptationSet>
 "#,
         id,
