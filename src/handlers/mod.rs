@@ -532,13 +532,14 @@ pub async fn handle_ts_segment_from_playlist(
         seg_url.as_str()
     ));
 
-    // Download TS bytes and pipe to ffmpeg stdin — the same transmux mode used for init
-    // segment generation. This ensures init moov and media moof boxes are produced by the
-    // same FFmpeg invocation style, keeping track IDs, timescales, and codec config consistent.
-    // Previously, init used stdin (no empty_moov) while media used URL (empty_moov), which
-    // produces structurally incompatible moov/moof layouts that stall Chrome MSE.
+    // Shift timestamps so each segment's tfdt reflects its position in the presentation
+    // timeline. Source TS segments all start at PTS=90000 (1 s at 90 kHz) due to per-segment
+    // timestamp resets; without this offset every segment would land at the same position in
+    // the MSE buffer and playback would never advance past the first segment.
+    let offset_secs = seg_idx as f64 * target_dur_ms as f64 / 1000.0;
+
     let fmp4_opt = match fetch_text(&state.http_client, seg_url.as_str()).await {
-        Ok((ts_bytes, _)) => crate::transmux::transmux_ts(ts_bytes).await.ok(),
+        Ok((ts_bytes, _)) => crate::transmux::transmux_ts_with_offset(ts_bytes, offset_secs).await.ok(),
         Err(_) => None,
     };
     let fmp4 = match fmp4_opt {
@@ -551,7 +552,7 @@ pub async fn handle_ts_segment_from_playlist(
             debug!(mini_m3u8 = %mini, temp_file = ?temp_path, "generated mini M3U8 fallback");
             tokio::fs::write(&temp_path, mini.as_bytes()).await
                 .map_err(|e| AppError::ParseError(format!("failed to write temp m3u8: {}", e)))?;
-            let result = crate::transmux::transmux_ts_from_file(temp_path.to_str().unwrap_or("")).await;
+            let result = crate::transmux::transmux_ts_from_file_with_offset(temp_path.to_str().unwrap_or(""), offset_secs).await;
             if result.is_ok() {
                 let _ = tokio::fs::remove_file(&temp_path).await;
             }

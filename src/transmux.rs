@@ -7,16 +7,18 @@ use tokio::process::Command;
 /// Transmux MPEG-TS bytes to fragmented MP4 via ffmpeg.
 /// Returns the full fMP4 output (ftyp + moov + moof + mdat).
 pub async fn transmux_ts(ts_bytes: Bytes) -> anyhow::Result<Bytes> {
+    transmux_ts_with_offset(ts_bytes, 0.0).await
+}
+
+/// Like `transmux_ts` but shifts all output timestamps by `offset_secs` seconds.
+/// Use this for media segments so each segment's tfdt reflects its position in the
+/// presentation timeline rather than the per-segment PTS reset (typically 1 s).
+pub async fn transmux_ts_with_offset(ts_bytes: Bytes, offset_secs: f64) -> anyhow::Result<Bytes> {
+    let offset_str = format!("{:.6}", offset_secs);
     let mut child = Command::new("ffmpeg")
-        .args([
-            "-loglevel", "error",
-            "-i", "pipe:0",
-            "-c", "copy",
-            "-bsf:a", "aac_adtstoasc",
-            "-movflags", "frag_keyframe+default_base_moof",
-            "-f", "mp4",
-            "pipe:1",
-        ])
+        .args(["-loglevel", "error", "-i", "pipe:0", "-c", "copy", "-bsf:a", "aac_adtstoasc"])
+        .args(["-output_ts_offset", offset_str.as_str()])
+        .args(["-movflags", "frag_keyframe+default_base_moof", "-f", "mp4", "pipe:1"])
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -118,7 +120,14 @@ pub async fn transmux_ts_from_segment_url(url: &str) -> anyhow::Result<Bytes> {
 
 /// Transmux a single-segment mini-playlist file to fMP4.
 /// Used for AES-128 encrypted segments where the key context is embedded in the M3U8.
+#[allow(dead_code)]
 pub async fn transmux_ts_from_file(path: &str) -> anyhow::Result<Bytes> {
+    transmux_ts_from_file_with_offset(path, 0.0).await
+}
+
+/// Like `transmux_ts_from_file` but shifts all output timestamps by `offset_secs` seconds.
+pub async fn transmux_ts_from_file_with_offset(path: &str, offset_secs: f64) -> anyhow::Result<Bytes> {
+    let offset_str = format!("{:.6}", offset_secs);
     let child = Command::new("ffmpeg")
         .args([
             "-loglevel", "error",
@@ -127,6 +136,7 @@ pub async fn transmux_ts_from_file(path: &str) -> anyhow::Result<Bytes> {
             "-i", path,
             "-c", "copy",
             "-bsf:a", "aac_adtstoasc",
+            "-output_ts_offset", offset_str.as_str(),
             "-movflags", "empty_moov+frag_keyframe+default_base_moof",
             "-f", "mp4",
             "pipe:1",
