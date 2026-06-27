@@ -36,7 +36,8 @@ impl Config {
             .map(|v| v == "true" || v == "1")
             .unwrap_or(false);
 
-        let version = env::var("VERSION").unwrap_or_else(|_| "unknown".to_string());
+        let version = env::var("VERSION")
+            .unwrap_or_else(|_| env!("CARGO_PKG_VERSION").to_string());
 
         Config {
             port,

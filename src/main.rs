@@ -38,6 +38,7 @@ async fn main() -> anyhow::Result<()> {
         .init();
 
     info!(
+        version = %config.version,
         port = config.port,
         proxy_base = %config.proxy_base,
         cache_capacity = config.cache_max_capacity,
