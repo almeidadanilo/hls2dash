@@ -69,6 +69,7 @@ pub async fn transmux_ts_from_url(url: &str) -> anyhow::Result<Bytes> {
 /// Transmux a single TS segment URL directly to fMP4.
 /// FFmpeg fetches the segment itself via HTTPS — no stdin pipe, no temp file.
 /// Works for unencrypted streams. For AES-128, use transmux_ts_from_file with a mini M3U8.
+#[allow(dead_code)]
 pub async fn transmux_ts_from_segment_url(url: &str) -> anyhow::Result<Bytes> {
     let child = Command::new("ffmpeg")
         .args([

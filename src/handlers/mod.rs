@@ -525,15 +525,23 @@ pub async fn handle_ts_segment_from_playlist(
         seg_url.as_str()
     ));
 
-    // Try transmuxing the segment URL directly first (works for unencrypted streams).
-    // Fall back to the mini M3U8 temp-file approach for AES-128 encrypted streams.
-    let fmp4 = match crate::transmux::transmux_ts_from_segment_url(seg_url.as_str()).await {
-        Ok(bytes) => bytes,
-        Err(direct_err) => {
-            debug!(err = %direct_err, "direct segment transmux failed, trying mini M3U8");
+    // Download TS bytes and pipe to ffmpeg stdin — the same transmux mode used for init
+    // segment generation. This ensures init moov and media moof boxes are produced by the
+    // same FFmpeg invocation style, keeping track IDs, timescales, and codec config consistent.
+    // Previously, init used stdin (no empty_moov) while media used URL (empty_moov), which
+    // produces structurally incompatible moov/moof layouts that stall Chrome MSE.
+    let fmp4_opt = match fetch_text(&state.http_client, seg_url.as_str()).await {
+        Ok((ts_bytes, _)) => crate::transmux::transmux_ts(ts_bytes).await.ok(),
+        Err(_) => None,
+    };
+    let fmp4 = match fmp4_opt {
+        Some(bytes) => bytes,
+        None => {
+            // Fallback for AES-128 encrypted or otherwise inaccessible segments.
+            debug!("stdin transmux failed, falling back to mini M3U8");
             let n = SEG_COUNTER.fetch_add(1, Ordering::Relaxed);
             let temp_path = std::env::temp_dir().join(format!("hls2dash_{}.m3u8", n));
-            debug!(mini_m3u8 = %mini, temp_file = ?temp_path, "generated mini M3U8");
+            debug!(mini_m3u8 = %mini, temp_file = ?temp_path, "generated mini M3U8 fallback");
             tokio::fs::write(&temp_path, mini.as_bytes()).await
                 .map_err(|e| AppError::ParseError(format!("failed to write temp m3u8: {}", e)))?;
             let result = crate::transmux::transmux_ts_from_file(temp_path.to_str().unwrap_or("")).await;
