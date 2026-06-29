@@ -212,6 +212,81 @@ fn patch_boxes(data: &mut [u8], start: usize, end: usize) {
     }
 }
 
+/// Rewrite the baseMediaDecodeTime in every tfdt box found inside every traf in the data.
+///
+/// Source HLS segments all start at PTS = 1 second in their track timescale (e.g. 90000
+/// for H.264 at 90 kHz, 44100/48000 for AAC). Because every independent TS transmux
+/// produces the same tfdt, the DASH player overwrites the same buffer position for every
+/// segment. This function adds `seg_idx × target_dur_ms` worth of ticks to each tfdt,
+/// correctly handling any per-track timescale by using the identity
+/// `track_timescale = current_tfdt` (valid when PTS offset == 1 s).
+pub fn patch_media_timestamps(media: &[u8], seg_idx: usize, target_dur_ms: u64) -> Bytes {
+    if seg_idx == 0 {
+        return Bytes::copy_from_slice(media);
+    }
+    let mut data = media.to_vec();
+    let len = data.len();
+    let mut pos = 0;
+    while pos + 8 <= len {
+        let size = u32::from_be_bytes(
+            data[pos..pos + 4].try_into().unwrap_or([0; 4])
+        ) as usize;
+        if size < 8 || pos + size > len {
+            break;
+        }
+        if &data[pos + 4..pos + 8] == b"moof" {
+            patch_moof_tfdts(&mut data, pos, pos + size, seg_idx, target_dur_ms);
+        }
+        pos += size;
+    }
+    Bytes::from(data)
+}
+
+fn patch_moof_tfdts(data: &mut [u8], moof_start: usize, moof_end: usize, seg_idx: usize, target_dur_ms: u64) {
+    let mut pos = moof_start + 8;
+    while pos + 8 <= moof_end {
+        let size = u32::from_be_bytes(
+            data[pos..pos + 4].try_into().unwrap_or([0; 4])
+        ) as usize;
+        if size < 8 || pos + size > moof_end {
+            break;
+        }
+        if &data[pos + 4..pos + 8] == b"traf" {
+            patch_traf_tfdt(data, pos, pos + size, seg_idx, target_dur_ms);
+        }
+        pos += size;
+    }
+}
+
+fn patch_traf_tfdt(data: &mut [u8], traf_start: usize, traf_end: usize, seg_idx: usize, target_dur_ms: u64) {
+    let mut pos = traf_start + 8;
+    while pos + 8 <= traf_end {
+        let size = u32::from_be_bytes(
+            data[pos..pos + 4].try_into().unwrap_or([0; 4])
+        ) as usize;
+        if size < 8 || pos + size > traf_end {
+            break;
+        }
+        if &data[pos + 4..pos + 8] == b"tfdt" {
+            let version = data[pos + 8];
+            if version == 0 && pos + 16 <= traf_end {
+                let cur = u32::from_be_bytes(data[pos + 12..pos + 16].try_into().unwrap_or([0; 4])) as u64;
+                // cur == track_timescale when source PTS offset == 1 s
+                let inc = (seg_idx as u64) * target_dur_ms * cur / 1000;
+                let new_val = ((cur + inc) as u32).to_be_bytes();
+                data[pos + 12..pos + 16].copy_from_slice(&new_val);
+            } else if version == 1 && pos + 20 <= traf_end {
+                let cur = u64::from_be_bytes(data[pos + 12..pos + 20].try_into().unwrap_or([0; 8]));
+                let inc = (seg_idx as u64) * target_dur_ms * cur / 1000;
+                let new_val = (cur + inc).to_be_bytes();
+                data[pos + 12..pos + 20].copy_from_slice(&new_val);
+            }
+            break; // only one tfdt per traf
+        }
+        pos += size;
+    }
+}
+
 /// Extract media segment — everything from the first `moof` box onwards.
 pub fn extract_media(fmp4: &[u8]) -> Option<Bytes> {
     find_box_offset(fmp4, b"moof").map(|pos| Bytes::copy_from_slice(&fmp4[pos..]))

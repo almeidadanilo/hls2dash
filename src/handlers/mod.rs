@@ -532,14 +532,8 @@ pub async fn handle_ts_segment_from_playlist(
         seg_url.as_str()
     ));
 
-    // Shift timestamps so each segment's tfdt reflects its position in the presentation
-    // timeline. Source TS segments all start at PTS=90000 (1 s at 90 kHz) due to per-segment
-    // timestamp resets; without this offset every segment would land at the same position in
-    // the MSE buffer and playback would never advance past the first segment.
-    let offset_secs = seg_idx as f64 * target_dur_ms as f64 / 1000.0;
-
     let fmp4_opt = match fetch_text(&state.http_client, seg_url.as_str()).await {
-        Ok((ts_bytes, _)) => crate::transmux::transmux_ts_with_offset(ts_bytes, offset_secs).await.ok(),
+        Ok((ts_bytes, _)) => crate::transmux::transmux_ts(ts_bytes).await.ok(),
         Err(_) => None,
     };
     let fmp4 = match fmp4_opt {
@@ -552,7 +546,7 @@ pub async fn handle_ts_segment_from_playlist(
             debug!(mini_m3u8 = %mini, temp_file = ?temp_path, "generated mini M3U8 fallback");
             tokio::fs::write(&temp_path, mini.as_bytes()).await
                 .map_err(|e| AppError::ParseError(format!("failed to write temp m3u8: {}", e)))?;
-            let result = crate::transmux::transmux_ts_from_file_with_offset(temp_path.to_str().unwrap_or(""), offset_secs).await;
+            let result = crate::transmux::transmux_ts_from_file(temp_path.to_str().unwrap_or("")).await;
             if result.is_ok() {
                 let _ = tokio::fs::remove_file(&temp_path).await;
             }
@@ -561,6 +555,13 @@ pub async fn handle_ts_segment_from_playlist(
     };
     let media = crate::transmux::extract_media(&fmp4)
         .ok_or_else(|| AppError::ParseError("no moof box in transmuxed segment output".into()))?;
+
+    // Patch tfdt in every traf box so each segment has cumulative timestamps.
+    // Source TS segments all start at PTS=1s in their track timescale due to per-segment
+    // resets; since base_tfdt == track_timescale (1s×TS), the increment for segment N is
+    // N × target_dur_ms × base_tfdt / 1000. presentationTimeOffset="1000" in the MPD then
+    // subtracts that 1s base so presentation time = N × target_dur seconds.
+    let media = crate::transmux::patch_media_timestamps(&media, seg_idx, target_dur_ms);
 
     let tfdt = crate::transmux::read_tfdt(&media);
     let moof_hex: Vec<String> = media.iter().take(16).map(|b| format!("{:02x}", b)).collect();
