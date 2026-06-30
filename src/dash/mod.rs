@@ -336,19 +336,12 @@ fn generate_segment_list(
     first_seg_url: Option<String>,
     transmux_ts: bool,
 ) -> String {
-    // For transmuxed TS, source segments start at PTS=90000 (1 s at 90 kHz). The timestamp
-    // offset applied in transmux_ts_with_offset shifts each segment by idx*dur seconds, so
-    // the media time of segment N is (1 + N*dur) seconds. presentationTimeOffset="1000"
-    // (1 s at timescale=1000) subtracts that base so presentation time = N*dur seconds.
-    let pto_attr = if !is_fmp4 && transmux_ts {
-        r#" presentationTimeOffset="1000""#
-    } else {
-        ""
-    };
+    // tfdt for segment N is patched to N * dur * timescale / 1000, so presentation time
+    // starts at 0 for segment 0 — no presentationTimeOffset needed.
     let mut lines = format!(
-        r#"        <SegmentList timescale="1000" duration="{}"{}>
+        r#"        <SegmentList timescale="1000" duration="{}">
 "#,
-        target_dur_ms, pto_attr
+        target_dur_ms
     );
 
     // Initialization segment: fMP4 uses the map entry; transmuxed TS uses the pre-computed init URL.
