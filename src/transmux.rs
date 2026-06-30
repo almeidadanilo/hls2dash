@@ -217,11 +217,11 @@ fn patch_boxes(data: &mut [u8], start: usize, end: usize) {
 /// Source HLS segments all start at PTS = 1 second in their track timescale (e.g. 90000
 /// for H.264 at 90 kHz, 44100/48000 for AAC). Because every independent TS transmux
 /// produces the same tfdt, the DASH player overwrites the same buffer position for every
-/// segment. This function sets each tfdt to `seg_idx × target_dur_ms × timescale / 1000`,
-/// making segment 0 start at presentation time 0 (no PTO required). The per-track
-/// timescale is derived from the identity `track_timescale = current_tfdt` (valid when
-/// the source PTS offset is exactly 1 s).
-pub fn patch_media_timestamps(media: &[u8], seg_idx: usize, target_dur_ms: u64) -> Bytes {
+/// segment. This function sets each tfdt to `cumulative_ms × timescale / 1000` where
+/// cumulative_ms is the sum of actual #EXTINF durations for all preceding segments.
+/// This aligns the media timeline with the MPD's per-segment SegmentURL durations so
+/// DASH.js sees no gap between consecutive segments regardless of variable segment length.
+pub fn patch_media_timestamps(media: &[u8], cumulative_ms: u64) -> Bytes {
     let mut data = media.to_vec();
     let len = data.len();
     let mut pos = 0;
@@ -233,14 +233,14 @@ pub fn patch_media_timestamps(media: &[u8], seg_idx: usize, target_dur_ms: u64) 
             break;
         }
         if &data[pos + 4..pos + 8] == b"moof" {
-            patch_moof_tfdts(&mut data, pos, pos + size, seg_idx, target_dur_ms);
+            patch_moof_tfdts(&mut data, pos, pos + size, cumulative_ms);
         }
         pos += size;
     }
     Bytes::from(data)
 }
 
-fn patch_moof_tfdts(data: &mut [u8], moof_start: usize, moof_end: usize, seg_idx: usize, target_dur_ms: u64) {
+fn patch_moof_tfdts(data: &mut [u8], moof_start: usize, moof_end: usize, cumulative_ms: u64) {
     let mut pos = moof_start + 8;
     while pos + 8 <= moof_end {
         let size = u32::from_be_bytes(
@@ -250,13 +250,13 @@ fn patch_moof_tfdts(data: &mut [u8], moof_start: usize, moof_end: usize, seg_idx
             break;
         }
         if &data[pos + 4..pos + 8] == b"traf" {
-            patch_traf_tfdt(data, pos, pos + size, seg_idx, target_dur_ms);
+            patch_traf_tfdt(data, pos, pos + size, cumulative_ms);
         }
         pos += size;
     }
 }
 
-fn patch_traf_tfdt(data: &mut [u8], traf_start: usize, traf_end: usize, seg_idx: usize, target_dur_ms: u64) {
+fn patch_traf_tfdt(data: &mut [u8], traf_start: usize, traf_end: usize, cumulative_ms: u64) {
     let mut pos = traf_start + 8;
     while pos + 8 <= traf_end {
         let size = u32::from_be_bytes(
@@ -268,13 +268,13 @@ fn patch_traf_tfdt(data: &mut [u8], traf_start: usize, traf_end: usize, seg_idx:
         if &data[pos + 4..pos + 8] == b"tfdt" {
             let version = data[pos + 8];
             if version == 0 && pos + 16 <= traf_end {
-                // cur == track_timescale (source PTS == 1 s); new tfdt starts at 0 for seg 0
+                // cur == track_timescale (source PTS == 1 s == timescale ticks)
                 let cur = u32::from_be_bytes(data[pos + 12..pos + 16].try_into().unwrap_or([0; 4])) as u64;
-                let new_val = (((seg_idx as u64) * target_dur_ms * cur / 1000) as u32).to_be_bytes();
+                let new_val = ((cumulative_ms * cur / 1000) as u32).to_be_bytes();
                 data[pos + 12..pos + 16].copy_from_slice(&new_val);
             } else if version == 1 && pos + 20 <= traf_end {
                 let cur = u64::from_be_bytes(data[pos + 12..pos + 20].try_into().unwrap_or([0; 8]));
-                let new_val = ((seg_idx as u64) * target_dur_ms * cur / 1000).to_be_bytes();
+                let new_val = (cumulative_ms * cur / 1000).to_be_bytes();
                 data[pos + 12..pos + 20].copy_from_slice(&new_val);
             }
             break; // only one tfdt per traf

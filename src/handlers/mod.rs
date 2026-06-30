@@ -556,17 +556,22 @@ pub async fn handle_ts_segment_from_playlist(
     let media = crate::transmux::extract_media(&fmp4)
         .ok_or_else(|| AppError::ParseError("no moof box in transmuxed segment output".into()))?;
 
-    // Patch tfdt in every traf box so each segment has cumulative timestamps.
-    // Source TS segments all start at PTS=1s in their track timescale due to per-segment
-    // resets; since base_tfdt == track_timescale (1s×TS), the increment for segment N is
-    // N × target_dur_ms × base_tfdt / 1000. presentationTimeOffset="1000" in the MPD then
-    // subtracts that 1s base so presentation time = N × target_dur seconds.
-    let media = crate::transmux::patch_media_timestamps(&media, seg_idx, target_dur_ms);
+    // Patch tfdt so each segment's baseMediaDecodeTime matches the cumulative wall-clock
+    // position derived from actual #EXTINF durations. This aligns the media timeline with
+    // the per-segment durations in the MPD SegmentList, preventing gaps caused by
+    // variable-length segments (e.g. a short first segment would otherwise leave a hole
+    // if we used uniform target_dur_ms positioning).
+    let cumulative_ms: u64 = media_pl.segments[..actual_idx]
+        .iter()
+        .map(|s| (s.duration * 1000.0).round() as u64)
+        .sum();
+    let media = crate::transmux::patch_media_timestamps(&media, cumulative_ms);
 
     let tfdt = crate::transmux::read_tfdt(&media);
     let moof_hex: Vec<String> = media.iter().take(16).map(|b| format!("{:02x}", b)).collect();
     tracing::info!(
         idx = seg_idx,
+        cumulative_ms,
         size = media.len(),
         moof_header = %moof_hex.join(" "),
         tfdt_base_media_decode_time = ?tfdt,
