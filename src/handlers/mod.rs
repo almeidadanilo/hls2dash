@@ -565,7 +565,8 @@ pub async fn handle_ts_segment_from_playlist(
         .iter()
         .map(|s| (s.duration * 1000.0).round() as u64)
         .sum();
-    let media = crate::transmux::patch_media_timestamps(&media, cumulative_ms);
+    let extinf_ms = (media_pl.segments[actual_idx].duration * 1000.0).round() as u64;
+    let media = crate::transmux::patch_media_timestamps(&media, cumulative_ms, extinf_ms);
 
     let tfdt = crate::transmux::read_tfdt(&media);
     let moof_hex: Vec<String> = media.iter().take(16).map(|b| format!("{:02x}", b)).collect();

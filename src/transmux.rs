@@ -212,16 +212,21 @@ fn patch_boxes(data: &mut [u8], start: usize, end: usize) {
     }
 }
 
-/// Rewrite the baseMediaDecodeTime in every tfdt box found inside every traf in the data.
+/// Rewrite the baseMediaDecodeTime in every tfdt box found inside every traf in the data,
+/// and extend the last sample's duration in each trun so the segment fills exactly the
+/// declared EXTINF window.
 ///
 /// Source HLS segments all start at PTS = 1 second in their track timescale (e.g. 90000
 /// for H.264 at 90 kHz, 44100/48000 for AAC). Because every independent TS transmux
 /// produces the same tfdt, the DASH player overwrites the same buffer position for every
 /// segment. This function sets each tfdt to `cumulative_ms × timescale / 1000` where
 /// cumulative_ms is the sum of actual #EXTINF durations for all preceding segments.
-/// This aligns the media timeline with the MPD's per-segment SegmentURL durations so
-/// DASH.js sees no gap between consecutive segments regardless of variable segment length.
-pub fn patch_media_timestamps(media: &[u8], cumulative_ms: u64) -> Bytes {
+///
+/// Some source HLS segments are sparse: EXTINF declares e.g. 4 s but the actual media
+/// frames only span ~1 s. The remaining 3 s appear as an MSE buffer hole, causing the
+/// gap controller to seek repeatedly. Extending the last sample's decode duration to fill
+/// the full EXTINF window eliminates those holes without changing any box sizes.
+pub fn patch_media_timestamps(media: &[u8], cumulative_ms: u64, extinf_ms: u64) -> Bytes {
     let mut data = media.to_vec();
     let len = data.len();
     let mut pos = 0;
@@ -233,14 +238,14 @@ pub fn patch_media_timestamps(media: &[u8], cumulative_ms: u64) -> Bytes {
             break;
         }
         if &data[pos + 4..pos + 8] == b"moof" {
-            patch_moof_tfdts(&mut data, pos, pos + size, cumulative_ms);
+            patch_moof_tfdts(&mut data, pos, pos + size, cumulative_ms, extinf_ms);
         }
         pos += size;
     }
     Bytes::from(data)
 }
 
-fn patch_moof_tfdts(data: &mut [u8], moof_start: usize, moof_end: usize, cumulative_ms: u64) {
+fn patch_moof_tfdts(data: &mut [u8], moof_start: usize, moof_end: usize, cumulative_ms: u64, extinf_ms: u64) {
     let mut pos = moof_start + 8;
     while pos + 8 <= moof_end {
         let size = u32::from_be_bytes(
@@ -250,13 +255,14 @@ fn patch_moof_tfdts(data: &mut [u8], moof_start: usize, moof_end: usize, cumulat
             break;
         }
         if &data[pos + 4..pos + 8] == b"traf" {
-            patch_traf_tfdt(data, pos, pos + size, cumulative_ms);
+            patch_traf_tfdt(data, pos, pos + size, cumulative_ms, extinf_ms);
         }
         pos += size;
     }
 }
 
-fn patch_traf_tfdt(data: &mut [u8], traf_start: usize, traf_end: usize, cumulative_ms: u64) {
+fn patch_traf_tfdt(data: &mut [u8], traf_start: usize, traf_end: usize, cumulative_ms: u64, extinf_ms: u64) {
+    let mut timescale: u64 = 0;
     let mut pos = traf_start + 8;
     while pos + 8 <= traf_end {
         let size = u32::from_be_bytes(
@@ -270,14 +276,92 @@ fn patch_traf_tfdt(data: &mut [u8], traf_start: usize, traf_end: usize, cumulati
             if version == 0 && pos + 16 <= traf_end {
                 // cur == track_timescale (source PTS == 1 s == timescale ticks)
                 let cur = u32::from_be_bytes(data[pos + 12..pos + 16].try_into().unwrap_or([0; 4])) as u64;
+                timescale = cur;
                 let new_val = ((cumulative_ms * cur / 1000) as u32).to_be_bytes();
                 data[pos + 12..pos + 16].copy_from_slice(&new_val);
             } else if version == 1 && pos + 20 <= traf_end {
                 let cur = u64::from_be_bytes(data[pos + 12..pos + 20].try_into().unwrap_or([0; 8]));
+                timescale = cur;
                 let new_val = (cumulative_ms * cur / 1000).to_be_bytes();
                 data[pos + 12..pos + 20].copy_from_slice(&new_val);
             }
             break; // only one tfdt per traf
+        }
+        pos += size;
+    }
+    if timescale > 0 && extinf_ms > 0 {
+        let expected_ticks = extinf_ms * timescale / 1000;
+        extend_traf_last_sample(data, traf_start, traf_end, expected_ticks);
+    }
+}
+
+/// If the sum of sample durations in the trun box is less than `expected_ticks`, extend the
+/// last sample's duration to cover the full expected window. This prevents MSE buffer holes
+/// in source segments whose actual media frames span less than the declared EXTINF duration.
+///
+/// Only operates when trun carries per-sample duration (flags bit 0x100 set). Skips silently
+/// if the format differs (e.g. default_sample_duration in tfhd), leaving the segment untouched.
+fn extend_traf_last_sample(data: &mut [u8], traf_start: usize, traf_end: usize, expected_ticks: u64) {
+    let mut pos = traf_start + 8;
+    while pos + 8 <= traf_end {
+        let size = u32::from_be_bytes(
+            data[pos..pos + 4].try_into().unwrap_or([0; 4])
+        ) as usize;
+        if size < 8 || pos + size > traf_end {
+            break;
+        }
+        if &data[pos + 4..pos + 8] == b"trun" {
+            let flags = u32::from_be_bytes([0, data[pos + 9], data[pos + 10], data[pos + 11]]);
+            let sample_count = u32::from_be_bytes(
+                data[pos + 12..pos + 16].try_into().unwrap_or([0; 4])
+            ) as usize;
+
+            let has_data_offset        = (flags & 0x001) != 0;
+            let has_first_sample_flags = (flags & 0x004) != 0;
+            let has_sample_duration    = (flags & 0x100) != 0;
+            let has_sample_size        = (flags & 0x200) != 0;
+            let has_sample_flags       = (flags & 0x400) != 0;
+            let has_cto                = (flags & 0x800) != 0;
+
+            if !has_sample_duration || sample_count == 0 {
+                break;
+            }
+
+            let stride = 4 * (has_sample_duration as usize
+                + has_sample_size as usize
+                + has_sample_flags as usize
+                + has_cto as usize);
+            if stride == 0 {
+                break;
+            }
+
+            let entry_base = pos + 16
+                + if has_data_offset { 4 } else { 0 }
+                + if has_first_sample_flags { 4 } else { 0 };
+
+            let mut total: u64 = 0;
+            let mut off = entry_base;
+            for _ in 0..sample_count {
+                if off + 4 > traf_end {
+                    break;
+                }
+                total += u32::from_be_bytes(
+                    data[off..off + 4].try_into().unwrap_or([0; 4])
+                ) as u64;
+                off += stride;
+            }
+
+            if total < expected_ticks {
+                let last_dur_off = entry_base + (sample_count - 1) * stride;
+                if last_dur_off + 4 <= traf_end {
+                    let old_dur = u32::from_be_bytes(
+                        data[last_dur_off..last_dur_off + 4].try_into().unwrap_or([0; 4])
+                    ) as u64;
+                    let new_dur = ((old_dur + expected_ticks - total) as u32).to_be_bytes();
+                    data[last_dur_off..last_dur_off + 4].copy_from_slice(&new_dur);
+                }
+            }
+            break; // one trun per traf is standard FFmpeg output
         }
         pos += size;
     }
