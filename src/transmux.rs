@@ -18,7 +18,14 @@ pub async fn transmux_ts_with_offset(ts_bytes: Bytes, offset_secs: f64) -> anyho
     let mut child = Command::new("ffmpeg")
         .args(["-loglevel", "error", "-i", "pipe:0", "-c", "copy", "-bsf:a", "aac_adtstoasc"])
         .args(["-output_ts_offset", offset_str.as_str()])
-        .args(["-movflags", "frag_keyframe+default_base_moof", "-f", "mp4", "pipe:1"])
+        // empty_moov is required: without it FFmpeg writes the first GOP as a
+        // conventional (non-fragmented) sample table with its data in a plain mdat
+        // that sits *before* the first moof box. extract_media() below only keeps
+        // data from the first moof onward, so without empty_moov the entire first
+        // GOP of every segment is silently dropped — the client only ever receives
+        // the later GOPs, cutting each segment short by however long its first GOP
+        // lasted and forcing an MSE gap-jump at every segment boundary.
+        .args(["-movflags", "empty_moov+frag_keyframe+default_base_moof", "-f", "mp4", "pipe:1"])
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
