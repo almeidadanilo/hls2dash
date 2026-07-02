@@ -19,6 +19,37 @@ pub struct AltRepData<'a> {
     pub media_playlist: Option<&'a MediaPlaylist>,
     pub playlist_url: Option<Url>,
     pub is_fmp4: bool,
+    /// Audio codec string (e.g. "mp4a.40.2"), extracted from whichever variant's
+    /// CODECS attribute references this alternate's group. None if not found.
+    pub codecs: Option<String>,
+}
+
+/// Split an HLS `CODECS` attribute (e.g. "avc1.640015,mp4a.40.2") into its non-audio
+/// (video) tokens. HLS lists every codec used by a variant — including its associated
+/// audio rendition — in one comma-separated attribute, but DASH requires each
+/// Representation's `codecs` to list only the codecs actually present in *its own*
+/// segments. When audio is demuxed into a separate AdaptationSet (a separate URI in
+/// EXT-X-MEDIA), the video Representation's segments no longer contain the audio track,
+/// so its declared codecs must drop the audio token — otherwise dash.js expects an AAC
+/// track inside the video-only init segment and rejects it outright.
+fn video_only_codecs(codecs: &str) -> String {
+    codecs
+        .split(',')
+        .map(str::trim)
+        .filter(|c| !is_audio_codec(c))
+        .collect::<Vec<_>>()
+        .join(",")
+}
+
+/// Extract the first audio-looking codec token from an HLS CODECS attribute.
+pub fn audio_codec_token(codecs: &str) -> Option<String> {
+    codecs.split(',').map(str::trim).find(|c| is_audio_codec(c)).map(str::to_string)
+}
+
+fn is_audio_codec(codec: &str) -> bool {
+    let c = codec.to_ascii_lowercase();
+    c.starts_with("mp4a") || c.starts_with("ac-3") || c.starts_with("ec-3")
+        || c.starts_with("opus") || c.starts_with("vorbis") || c.starts_with("alac")
 }
 
 /// Top-level parameters for MPD generation.
@@ -92,13 +123,16 @@ pub fn generate_mpd(params: &MpdParams<'_>) -> String {
     let mut adaptation_sets = String::new();
     let mut as_id = 1usize;
 
-    // Video AdaptationSet
+    // Video AdaptationSet. When any audio alternates resolved to their own separate
+    // playlist, audio is demuxed and must not be declared in the video codecs string.
+    let has_separate_audio = params.audio_reps.iter().any(|a| a.playlist_url.is_some());
     if !params.video_reps.is_empty() {
         adaptation_sets.push_str(&generate_video_adaptation_set(
             as_id,
             &params.video_reps,
             params.proxy_base,
             params.transmux_ts,
+            has_separate_audio,
         ));
         as_id += 1;
     }
@@ -146,6 +180,7 @@ fn generate_video_adaptation_set(
     reps: &[RepresentationData<'_>],
     proxy_base: &str,
     transmux_ts: bool,
+    has_separate_audio: bool,
 ) -> String {
     // Check for DRM (AES-128) in any representation.
     let content_protection = reps.iter().find_map(|r| {
@@ -163,7 +198,7 @@ fn generate_video_adaptation_set(
 
     let mut representations = String::new();
     for rep in reps {
-        representations.push_str(&generate_video_representation(rep, proxy_base, transmux_ts));
+        representations.push_str(&generate_video_representation(rep, proxy_base, transmux_ts, has_separate_audio));
     }
 
     format!(
@@ -176,7 +211,12 @@ fn generate_video_adaptation_set(
     )
 }
 
-fn generate_video_representation(rep: &RepresentationData<'_>, proxy_base: &str, transmux_ts: bool) -> String {
+fn generate_video_representation(
+    rep: &RepresentationData<'_>,
+    proxy_base: &str,
+    transmux_ts: bool,
+    has_separate_audio: bool,
+) -> String {
     let mime_type = if rep.is_fmp4 {
         "video/mp4"
     } else if transmux_ts {
@@ -190,7 +230,9 @@ fn generate_video_representation(rep: &RepresentationData<'_>, proxy_base: &str,
         .variant
         .codecs
         .as_deref()
-        .map(|c| format!(r#" codecs="{}""#, xml_escape(c)))
+        .map(|c| if has_separate_audio { video_only_codecs(c) } else { c.to_string() })
+        .filter(|c| !c.is_empty())
+        .map(|c| format!(r#" codecs="{}""#, xml_escape(&c)))
         .unwrap_or_default();
 
     let resolution_attrs = rep
@@ -270,13 +312,20 @@ fn generate_audio_adaptation_set(id: usize, rep: &AltRepData<'_>, proxy_base: &s
             None
         };
 
+        let codecs_attr = rep
+            .codecs
+            .as_deref()
+            .map(|c| format!(r#" codecs="{}""#, xml_escape(c)))
+            .unwrap_or_default();
+
         let segment_list = generate_segment_list(pl, url, rep.is_fmp4, target_dur_ms, proxy_base, first_seg_url, transmux_ts);
         format!(
-            r#"      <Representation id="{}" mimeType="{}" bandwidth="128000">
+            r#"      <Representation id="{}" mimeType="{}"{} bandwidth="128000">
 {}      </Representation>
 "#,
             xml_escape(&rep.id),
             mime_type,
+            codecs_attr,
             segment_list
         )
     } else {

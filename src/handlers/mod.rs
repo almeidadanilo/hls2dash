@@ -225,12 +225,21 @@ async fn handle_manifest(state: AppState, upstream_url: String) -> Result<Respon
                         .get(i)
                         .and_then(|o| o.as_ref())
                         .map(|(u, p)| (u, p));
+                    // Codecs aren't declared on EXT-X-MEDIA itself — find them on whichever
+                    // variant references this alternate's group via its own CODECS attribute.
+                    let codecs = master
+                        .variants
+                        .iter()
+                        .find(|v| v.audio.as_deref() == Some(alt.group_id.as_str()))
+                        .and_then(|v| v.codecs.as_deref())
+                        .and_then(crate::dash::audio_codec_token);
                     AltRepData {
                         id: format!("a{}", i + 1),
                         alt,
                         media_playlist: pl_data.map(|(_, p)| p),
                         playlist_url: pl_data.map(|(u, _)| u.clone()),
                         is_fmp4: pl_data.map(|(_, p)| is_fmp4(p)).unwrap_or(false),
+                        codecs,
                     }
                 })
                 .collect();
@@ -250,6 +259,7 @@ async fn handle_manifest(state: AppState, upstream_url: String) -> Result<Respon
                         media_playlist: pl_data.map(|(_, p)| p),
                         playlist_url: pl_data.map(|(u, _)| u.clone()),
                         is_fmp4: pl_data.map(|(_, p)| is_fmp4(p)).unwrap_or(false),
+                        codecs: None,
                     }
                 })
                 .collect();
