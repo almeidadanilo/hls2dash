@@ -43,6 +43,7 @@ async fn main() -> anyhow::Result<()> {
         proxy_base = %config.proxy_base,
         cache_capacity = config.cache_max_capacity,
         upstream_timeout_secs = config.upstream_timeout_secs,
+        max_concurrent_transmux = config.max_concurrent_transmux,
         "starting hls2dash"
     );
 
@@ -57,10 +58,15 @@ async fn main() -> anyhow::Result<()> {
     // Build playlist cache (global TTL = 5 s; per-playlist TTL would require moka Expiry).
     let playlist_cache = Arc::new(Cache::new(config.cache_max_capacity, 5));
 
+    // Caps concurrent ffmpeg transmux jobs — each buffers its full input/output in memory
+    // and spawns a process, so this bounds memory/CPU use under concurrent playback.
+    let transmux_semaphore = Arc::new(tokio::sync::Semaphore::new(config.max_concurrent_transmux));
+
     let state = AppState {
         http_client,
         playlist_cache,
         config: config.clone(),
+        transmux_semaphore,
     };
 
     let cors = CorsLayer::new()

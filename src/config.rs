@@ -9,6 +9,10 @@ pub struct Config {
     pub log_level: String,
     pub transmux_ts: bool,
     pub version: String,
+    /// Maximum number of ffmpeg transmux jobs (segment/init requests) allowed to run at
+    /// once. Each job buffers its full input and output in memory and spawns a process,
+    /// so on small instances this must be capped to avoid OOM under concurrent playback.
+    pub max_concurrent_transmux: usize,
 }
 
 impl Config {
@@ -39,6 +43,11 @@ impl Config {
         let version = env::var("VERSION")
             .unwrap_or_else(|_| env!("CARGO_PKG_VERSION").to_string());
 
+        let max_concurrent_transmux = env::var("MAX_CONCURRENT_TRANSMUX")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(6usize);
+
         Config {
             port,
             proxy_base,
@@ -47,6 +56,7 @@ impl Config {
             log_level,
             transmux_ts,
             version,
+            max_concurrent_transmux,
         }
     }
 }

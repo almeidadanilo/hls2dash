@@ -1,6 +1,6 @@
 [package]
 name = "hls2dash"
-version = "1.1.23"
+version = "1.1.24"
 edition = "2021"
 description = "HLS to DASH transpackaging proxy"
 

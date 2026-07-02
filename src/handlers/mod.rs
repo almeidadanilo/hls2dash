@@ -17,6 +17,7 @@ use futures::future::join_all;
 use reqwest::Client;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
+use tokio::sync::Semaphore;
 use tracing::debug;
 use url::Url;
 
@@ -27,6 +28,9 @@ pub struct AppState {
     pub http_client: Client,
     pub playlist_cache: Arc<Cache>,
     pub config: Config,
+    /// Bounds how many ffmpeg transmux jobs run concurrently — see
+    /// `Config::max_concurrent_transmux`.
+    pub transmux_semaphore: Arc<Semaphore>,
 }
 
 /// Health-check endpoint — returns the service version.
@@ -373,6 +377,7 @@ fn mpd_response(mpd: String) -> Result<Response, AppError> {
 async fn handle_ts_segment(state: AppState, upstream_url: String) -> Result<Response, AppError> {
     debug!(url = %upstream_url, "handling TS segment with transmux");
 
+    let _permit = state.transmux_semaphore.acquire().await.expect("semaphore never closed");
     let (ts_bytes, _) = fetch_text(&state.http_client, &upstream_url).await?;
     let fmp4 = crate::transmux::transmux_ts(ts_bytes)
         .await
@@ -399,10 +404,12 @@ pub async fn handle_ts_init(
 
     let client = state.http_client.clone();
     let url_owned = upstream_url.clone();
+    let semaphore = state.transmux_semaphore.clone();
 
     let result = state
         .playlist_cache
         .get_or_fetch(format!("init:{}", upstream_url), move || async move {
+            let _permit = semaphore.acquire().await.expect("semaphore never closed");
             let (ts_bytes, _) = fetch_text(&client, &url_owned)
                 .await
                 .map_err(anyhow::Error::from)?;
@@ -439,13 +446,14 @@ pub async fn handle_ts_init(
 /// demuxer which produces a moov with complete codec configuration (SPS/PPS in avcC).
 /// The HLS demuxer path is required because Chrome MSE rejects init segments without SPS/PPS.
 pub async fn handle_ts_init_from_playlist(
-    State(_state): State<AppState>,
+    State(state): State<AppState>,
     Path(path): Path<String>,
     RawQuery(query): RawQuery,
 ) -> Result<Response, AppError> {
     let playlist_url = build_upstream_url(&path, query.as_deref());
     debug!(url = %playlist_url, "handling TS init from playlist via ffmpeg HLS demuxer");
 
+    let _permit = state.transmux_semaphore.acquire().await.expect("semaphore never closed");
     let fmp4 = crate::transmux::transmux_ts_from_url(&playlist_url)
         .await
         .map_err(|e| AppError::ParseError(e.to_string()))?;
@@ -542,6 +550,7 @@ pub async fn handle_ts_segment_from_playlist(
         seg_url.as_str()
     ));
 
+    let _permit = state.transmux_semaphore.acquire().await.expect("semaphore never closed");
     let fmp4_opt = match fetch_text(&state.http_client, seg_url.as_str()).await {
         Ok((ts_bytes, _)) => crate::transmux::transmux_ts(ts_bytes).await.ok(),
         Err(_) => None,
@@ -557,9 +566,9 @@ pub async fn handle_ts_segment_from_playlist(
             tokio::fs::write(&temp_path, mini.as_bytes()).await
                 .map_err(|e| AppError::ParseError(format!("failed to write temp m3u8: {}", e)))?;
             let result = crate::transmux::transmux_ts_from_file(temp_path.to_str().unwrap_or("")).await;
-            if result.is_ok() {
-                let _ = tokio::fs::remove_file(&temp_path).await;
-            }
+            // Always clean up, not just on success — otherwise a run of failures (e.g.
+            // upstream flakiness) leaks a temp file per request and slowly fills disk.
+            let _ = tokio::fs::remove_file(&temp_path).await;
             result.map_err(|e| AppError::ParseError(e.to_string()))?
         }
     };
