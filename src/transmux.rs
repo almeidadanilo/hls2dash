@@ -25,7 +25,16 @@ pub async fn transmux_ts_with_offset(ts_bytes: Bytes, offset_secs: f64) -> anyho
         // GOP of every segment is silently dropped — the client only ever receives
         // the later GOPs, cutting each segment short by however long its first GOP
         // lasted and forcing an MSE gap-jump at every segment boundary.
-        .args(["-movflags", "empty_moov+frag_keyframe+default_base_moof", "-f", "mp4", "pipe:1"])
+        //
+        // delay_moov is also required together with empty_moov: without it, FFmpeg
+        // writes the moov before the aac_adtstoasc bitstream filter has populated the
+        // AAC AudioSpecificConfig, producing an audio `esds` box with a truncated
+        // DecoderConfigDescriptor (missing DecoderSpecificInfo entirely). Chrome's MSE
+        // demuxer rejects that outright with CHUNK_DEMUXER_ERROR_APPEND_FAILED /
+        // "stream parsing failed" on the very first appendBuffer call. delay_moov
+        // defers writing moov until the first fragment is ready, by which point the
+        // bsf has seen an ADTS frame and set the real extradata.
+        .args(["-movflags", "empty_moov+delay_moov+frag_keyframe+default_base_moof", "-f", "mp4", "pipe:1"])
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -92,7 +101,10 @@ pub async fn transmux_ts_from_segment_url(url: &str) -> anyhow::Result<Bytes> {
             "-bsf:a", "aac_adtstoasc",
             // empty_moov forces fMP4 container mode immediately, preventing fallback
             // to non-fragmented MP4 when the MPEG-TS demuxer misses keyframe flags.
-            "-movflags", "empty_moov+frag_keyframe+default_base_moof",
+            // delay_moov must accompany it: without it, the moov is written before
+            // aac_adtstoasc has populated the AAC extradata, producing an esds box
+            // Chrome's MSE demuxer rejects outright (see transmux_ts_with_offset).
+            "-movflags", "empty_moov+delay_moov+frag_keyframe+default_base_moof",
             "-f", "mp4",
             "pipe:1",
         ])
@@ -144,7 +156,10 @@ pub async fn transmux_ts_from_file_with_offset(path: &str, offset_secs: f64) -> 
             "-c", "copy",
             "-bsf:a", "aac_adtstoasc",
             "-output_ts_offset", offset_str.as_str(),
-            "-movflags", "empty_moov+frag_keyframe+default_base_moof",
+            // delay_moov: see transmux_ts_with_offset — required alongside empty_moov
+            // whenever aac_adtstoasc is in play, or the audio esds ends up missing its
+            // DecoderSpecificInfo and Chrome's MSE demuxer rejects the whole segment.
+            "-movflags", "empty_moov+delay_moov+frag_keyframe+default_base_moof",
             "-f", "mp4",
             "pipe:1",
         ])
