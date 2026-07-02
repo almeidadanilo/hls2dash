@@ -219,33 +219,95 @@ fn patch_boxes(data: &mut [u8], start: usize, end: usize) {
     }
 }
 
+/// Read each track's real timescale from its `mdhd` box in the `moov`, keyed by the
+/// track_ID from the corresponding `tkhd`. This is the authoritative source for timescale
+/// — do not infer it from tfdt values (see `patch_media_timestamps`).
+pub fn read_track_timescales(fmp4: &[u8]) -> std::collections::HashMap<u32, u64> {
+    use std::collections::HashMap;
+    let mut out = HashMap::new();
+    let Some(moov_off) = find_box_offset(fmp4, b"moov") else {
+        return out;
+    };
+    let moov_size = match fmp4.get(moov_off..moov_off + 4).and_then(|s| s.try_into().ok()) {
+        Some(b) => u32::from_be_bytes(b) as usize,
+        None => return out,
+    };
+    let moov_end = moov_off + moov_size;
+    let mut pos = moov_off + 8;
+    while pos + 8 <= moov_end {
+        let size = u32::from_be_bytes(fmp4[pos..pos + 4].try_into().unwrap_or([0; 4])) as usize;
+        if size < 8 || pos + size > moov_end {
+            break;
+        }
+        if &fmp4[pos + 4..pos + 8] == b"trak" {
+            let trak_end = pos + size;
+            if let (Some(track_id), Some(timescale)) = (
+                find_box_in_range(fmp4, pos + 8, trak_end, b"tkhd").and_then(|off| {
+                    // tkhd fullbox: version(1)+flags(3), then creation_time/modification_time
+                    // (4 bytes each for v0, 8 bytes each for v1) precede track_ID — unlike
+                    // tfhd, where track_ID sits immediately after the flags.
+                    let version = *fmp4.get(off + 8)?;
+                    let id_off = if version == 0 { off + 20 } else { off + 28 };
+                    fmp4.get(id_off..id_off + 4)
+                })
+                    .and_then(|b| b.try_into().ok())
+                    .map(u32::from_be_bytes),
+                find_box_in_range(fmp4, pos + 8, trak_end, b"mdia").and_then(|mdia_off| {
+                    let mdia_size = u32::from_be_bytes(
+                        fmp4[mdia_off..mdia_off + 4].try_into().unwrap_or([0; 4]),
+                    ) as usize;
+                    find_box_in_range(fmp4, mdia_off + 8, mdia_off + mdia_size, b"mdhd")
+                        .and_then(|off| fmp4.get(off + 8).map(|&v| (off, v)))
+                        .and_then(|(off, version)| {
+                            let ts_off = if version == 0 { off + 20 } else { off + 28 };
+                            fmp4.get(ts_off..ts_off + 4)
+                        })
+                        .and_then(|b| b.try_into().ok())
+                        .map(u32::from_be_bytes)
+                }),
+            ) {
+                out.insert(track_id, timescale as u64);
+            }
+        }
+        pos += size;
+    }
+    out
+}
+
 /// Rewrite the baseMediaDecodeTime in every tfdt box found inside every traf in the data,
 /// and extend the last sample's duration in the final fragment so the segment fills
 /// exactly the declared EXTINF window.
 ///
-/// Source HLS segments all start at PTS = 1 second in their track timescale (e.g. 90000
-/// for H.264 at 90 kHz, 44100/48000 for AAC). Because every independent TS transmux
-/// produces the same starting tfdt, the DASH player would overwrite the same buffer
+/// Every independent TS-segment transmux starts its own decode timeline (FFmpeg picks
+/// whatever start offset it likes — sometimes 0, sometimes a 1 s reset — depending on
+/// muxer flags), so left unpatched, the DASH player would overwrite the same buffer
 /// position for every segment. This function shifts every tfdt in the segment by a
 /// constant per-track delta so that the *first* fragment lands at
 /// `cumulative_ms × timescale / 1000` — the sum of actual #EXTINF durations for all
-/// preceding segments — while preserving the original spacing between fragments.
+/// preceding segments — while preserving the original spacing between fragments. The
+/// timescale must come from the real `mdhd` box (see `read_track_timescales`): the raw
+/// tfdt value cannot be assumed to equal the timescale, since that only held for one
+/// specific FFmpeg configuration and silently produced near-zero (wrong) deltas once the
+/// transmux flags changed.
 ///
 /// A single TS segment can produce more than one moof/traf pair: FFmpeg's
 /// `frag_keyframe` starts a new fragment at every keyframe, so a segment whose GOP is
 /// shorter than its EXTINF duration (e.g. 2 s GOP inside a 6 s segment) yields several
-/// fragments. Earlier code treated every traf's *raw* tfdt value as if it equalled the
-/// track timescale (true only for the first fragment) and overwrote it outright,
-/// corrupting the timestamps of every later fragment in the same segment and causing
-/// the player to jump forward once per GOP. We now compute the delta once per track from
-/// the first fragment only, then add (not overwrite) it everywhere.
+/// fragments. We compute the delta once per track from the first fragment only, then add
+/// (not overwrite) it everywhere, preserving FFmpeg's correct internal spacing between
+/// fragments.
 ///
 /// Some source HLS segments are sparse: EXTINF declares e.g. 4 s but the actual media
 /// frames only span ~1 s. The remaining time appears as an MSE buffer hole, causing the
 /// gap controller to seek repeatedly. Extending the last sample's decode duration in the
 /// final fragment to fill the full EXTINF window eliminates those holes without changing
 /// any box sizes.
-pub fn patch_media_timestamps(media: &[u8], cumulative_ms: u64, extinf_ms: u64) -> Bytes {
+pub fn patch_media_timestamps(
+    media: &[u8],
+    timescales: &std::collections::HashMap<u32, u64>,
+    cumulative_ms: u64,
+    extinf_ms: u64,
+) -> Bytes {
     use std::collections::HashMap;
 
     let mut data = media.to_vec();
@@ -267,9 +329,9 @@ pub fn patch_media_timestamps(media: &[u8], cumulative_ms: u64, extinf_ms: u64) 
         return Bytes::from(data);
     }
 
-    // Per-track timescale, taken from the first fragment's original tfdt value (which
-    // equals the timescale because the source PTS reset is exactly 1 s).
-    let mut timescale_of: HashMap<u32, u64> = HashMap::new();
+    // Per-track additive delta, fixed from the first fragment seen for that track so
+    // every later fragment's original spacing relative to it is preserved.
+    let mut delta_of: HashMap<u32, i128> = HashMap::new();
     // Byte range of the most recently seen traf per track, so we know which fragment is
     // "last" for the EXTINF hole-filling extension.
     let mut last_traf_of: HashMap<u32, (usize, usize)> = HashMap::new();
@@ -296,20 +358,22 @@ pub fn patch_media_timestamps(media: &[u8], cumulative_ms: u64, extinf_ms: u64) 
                         if version == 0 && tfdt_off + 16 <= traf_end {
                             let old = u32::from_be_bytes(
                                 data[tfdt_off + 12..tfdt_off + 16].try_into().unwrap_or([0; 4]),
-                            ) as u64;
-                            let timescale = *timescale_of.entry(track_id).or_insert(old.max(1));
-                            let delta = (cumulative_ms as i128 * timescale as i128 / 1000)
-                                - timescale as i128;
-                            let new_val = (old as i128 + delta).max(0) as u32;
+                            ) as i128;
+                            let timescale = *timescales.get(&track_id).unwrap_or(&90_000) as i128;
+                            let delta = *delta_of
+                                .entry(track_id)
+                                .or_insert_with(|| cumulative_ms as i128 * timescale / 1000 - old);
+                            let new_val = (old + delta).max(0) as u32;
                             data[tfdt_off + 12..tfdt_off + 16].copy_from_slice(&new_val.to_be_bytes());
                         } else if version == 1 && tfdt_off + 20 <= traf_end {
                             let old = u64::from_be_bytes(
                                 data[tfdt_off + 12..tfdt_off + 20].try_into().unwrap_or([0; 8]),
-                            );
-                            let timescale = *timescale_of.entry(track_id).or_insert(old.max(1));
-                            let delta = (cumulative_ms as i128 * timescale as i128 / 1000)
-                                - timescale as i128;
-                            let new_val = (old as i128 + delta).max(0) as u64;
+                            ) as i128;
+                            let timescale = *timescales.get(&track_id).unwrap_or(&90_000) as i128;
+                            let delta = *delta_of
+                                .entry(track_id)
+                                .or_insert_with(|| cumulative_ms as i128 * timescale / 1000 - old);
+                            let new_val = (old + delta).max(0) as u64;
                             data[tfdt_off + 12..tfdt_off + 20].copy_from_slice(&new_val.to_be_bytes());
                         }
                     }
@@ -321,7 +385,7 @@ pub fn patch_media_timestamps(media: &[u8], cumulative_ms: u64, extinf_ms: u64) 
 
     if extinf_ms > 0 {
         for (track_id, (traf_start, traf_end)) in last_traf_of {
-            if let Some(&timescale) = timescale_of.get(&track_id) {
+            if let Some(&timescale) = timescales.get(&track_id) {
                 let expected_ticks = extinf_ms * timescale / 1000;
                 let total = total_ticks_of.get(&track_id).copied().unwrap_or(0);
                 if total < expected_ticks {

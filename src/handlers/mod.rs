@@ -553,6 +553,10 @@ pub async fn handle_ts_segment_from_playlist(
             result.map_err(|e| AppError::ParseError(e.to_string()))?
         }
     };
+    // Real per-track timescales must be read from the moov (mdhd) before it's stripped
+    // off below — the tfdt patching cannot infer timescale from raw tfdt values (that
+    // only worked for one specific FFmpeg reset behavior and silently broke otherwise).
+    let timescales = crate::transmux::read_track_timescales(&fmp4);
     let media = crate::transmux::extract_media(&fmp4)
         .ok_or_else(|| AppError::ParseError("no moof box in transmuxed segment output".into()))?;
 
@@ -566,7 +570,7 @@ pub async fn handle_ts_segment_from_playlist(
         .map(|s| (s.duration * 1000.0).round() as u64)
         .sum();
     let extinf_ms = (media_pl.segments[actual_idx].duration * 1000.0).round() as u64;
-    let media = crate::transmux::patch_media_timestamps(&media, cumulative_ms, extinf_ms);
+    let media = crate::transmux::patch_media_timestamps(&media, &timescales, cumulative_ms, extinf_ms);
 
     let tfdt = crate::transmux::read_tfdt(&media);
     let moof_hex: Vec<String> = media.iter().take(16).map(|b| format!("{:02x}", b)).collect();
